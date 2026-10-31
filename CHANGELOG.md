@@ -5,6 +5,8 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-10-31
+
 ### Added
 - **Azure AI Speech as a cloud provider.** Under **Engines → Cloud voices**
   you can now add a Microsoft Azure Speech key together with the Azure
