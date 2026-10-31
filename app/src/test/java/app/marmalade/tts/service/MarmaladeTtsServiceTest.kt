@@ -509,19 +509,59 @@ class MarmaladeTtsServiceTest {
     }
 
     @Test
-    fun onSynthesizeText_deliberateVoicePick_stillBeatsPrimaryAlias() {
+    fun onSynthesizeText_deliberatePickOfAnotherLanguage_stillBeatsPrimaryAlias() {
         installKittenPrimary()
         fakeKokoroDirectEngine.nextPcm = ShortArray(1024) { 0 }
 
-        // bm_lewis is neither the advertised default nor the primary's
-        // voice — a deliberate caller pick, honored at 1.0× with no effect.
-        val request = newRequestWithVoice("hello", "kokoro-direct-v1_0:bm_lewis")
+        // A Spanish voice while the primary alias is English: the caller
+        // asked for a voice the primary can't represent, so it is the
+        // multilingual path, honored at 1.0× with no effect.
+        val request = newRequestWithVoice(
+            "La descarga ha terminado.",
+            "kokoro-direct-v1_0:ef_dora",
+        )
         service.onSynthesizeText(request, FakeSynthesisCallback())
 
         assertEquals(0, fakeEngine.calls.size)
         val (_, voiceId, speed) = fakeKokoroDirectEngine.calls.single()
-        assertEquals("kokoro-direct-v1_0:bm_lewis", voiceId)
+        assertEquals("kokoro-direct-v1_0:ef_dora", voiceId)
         assertEquals(1.0f, speed)
+    }
+
+    @Test
+    fun onSynthesizeText_sameLanguageVoicePick_yieldsToPrimaryAlias() {
+        installKittenPrimary()
+        fakeKokoroDirectEngine.nextPcm = ShortArray(1024) { 0 }
+
+        // bm_lewis speaks the primary's own language (English). Clients
+        // cache whatever voice they were shown and stamp it forever, so a
+        // same-language request is the system default coming back, not a
+        // pick: the primary alias stays in charge. Per-app mappings are
+        // the supported way to give one app its own voice.
+        val request = newRequestWithVoice("hello", "kokoro-direct-v1_0:bm_lewis")
+        service.onSynthesizeText(request, FakeSynthesisCallback())
+
+        assertEquals(0, fakeKokoroDirectEngine.calls.size)
+        assertEquals("kitten-direct-v0_8:Bella", fakeEngine.calls.single().second)
+    }
+
+    @Test
+    fun onSynthesizeText_staleSameLanguageDefault_yieldsToChangedPrimaryAlias() {
+        // Boox Leaf reader, 2026-10-31: the primary alias is a zh-CN Azure
+        // voice, but the reader kept stamping the zh-CN voice it had
+        // cached. Both speak Chinese, so the stale value is an echo even
+        // though it was never recorded as an English default — the
+        // primary's new voice must win.
+        installKokoroPrimary(voiceId = "kokoro-direct-v1_0:zf_xiaobei")
+        fakeKokoroDirectEngine.nextPcm = ShortArray(1024) { 0 }
+
+        installKokoroPrimary(voiceId = "kokoro-direct-v1_0:zf_xiaoni")
+        service.onSynthesizeText(
+            newRequestWithVoice("你好，世界", "kokoro-direct-v1_0:zf_xiaobei"),
+            FakeSynthesisCallback(),
+        )
+
+        assertEquals("kokoro-direct-v1_0:zf_xiaoni", fakeKokoroDirectEngine.calls.single().second)
     }
 
     @Test
@@ -1073,23 +1113,23 @@ class MarmaladeTtsServiceTest {
     }
 
     @Test
-    fun onSynthesizeText_aDeliberatelyPickedVoiceIsNeverRerouted() {
+    fun onSynthesizeText_aDeliberatelyPickedVoiceOfAnotherLanguageIsNeverRerouted() {
         installKittenPrimary(phonemizationLanguage = "auto")
+        val german = installKokoroGerman()
+        german.nextPcm = ShortArray(1024)
         fakeKokoroDirectEngine.nextPcm = ShortArray(1024)
         fakeEngine.nextPcm = ShortArray(1024)
 
-        // Another voice than the alias's: the caller chose it, so it speaks
-        // as itself, with no alias language, even though a Spanish Kokoro
-        // voice is installed.
-        val request = newRequestWithVoice(
-            "La descarga ha terminado y el archivo está listo para usar.",
-            "kitten-direct-v0_8:Leo",
-        )
+        // A Spanish voice for German text: another language than the
+        // alias's, so the caller chose it. It speaks as itself, never
+        // rerouted to Thorsten — Kokoro phonemizes the detected German
+        // in that voice (null is its auto sentinel).
+        val request = newRequestWithVoice(germanText, "kokoro-direct-v1_0:ef_dora")
         service.onSynthesizeText(request, FakeSynthesisCallback())
 
-        assertEquals(0, fakeKokoroDirectEngine.calls.size)
-        assertEquals("kitten-direct-v0_8:Leo", fakeEngine.calls.single().second)
-        assertNull(fakeEngine.languages.single())
+        assertEquals(0, german.calls.size)
+        assertEquals("kokoro-direct-v1_0:ef_dora", fakeKokoroDirectEngine.calls.single().second)
+        assertEquals("de", fakeKokoroDirectEngine.languages.single())
     }
 
     @Test

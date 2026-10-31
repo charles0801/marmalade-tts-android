@@ -24,13 +24,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 - **Changing the primary alias's voice now reaches apps that use Marmalade
-  as the system voice.** Some TTS clients cache the default voice the engine
-  advertises and keep sending it after the user changes that alias's voice;
-  the cached value looked like a deliberate choice and outranked the primary
-  alias, so system TTS kept speaking the first voice selected. The engine now
-  remembers the defaults it has advertised and treats a cached one as an
-  echo of the default, so the alias's current voice wins. It needs no app
-  reload and survives restarts.
+  as the system voice**, in every language. Some TTS clients cache the
+  default voice the engine advertises and keep sending it after the user
+  changes that alias's voice; the cached value looked like a deliberate
+  choice and outranked the primary alias, so system TTS kept speaking the
+  first voice selected. A requested voice now counts as an echo of the
+  default whenever it speaks the primary alias's own language (the earlier
+  fix only recognised English defaults, so e-readers reading Chinese kept
+  the old voice). Requests in a different language are still honoured, so
+  reading French with an English primary keeps a French voice. It needs no
+  app reload and survives restarts.
 
 ## [1.3.3] - 2026-10-23
 

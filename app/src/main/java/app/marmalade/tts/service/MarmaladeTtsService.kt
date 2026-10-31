@@ -70,7 +70,8 @@ import kotlinx.coroutines.runBlocking
 //      │   engineNameFor(voiceId)  ──► "kokoro" | "kitten"   match: kokoro
 //      │
 //      ├── if voiceName is absent OR merely echoes our advertised default
-//      │    (clients auto-fill it from onGetDefaultVoiceNameFor): routing fires
+//      │    (clients auto-fill it from onGetDefaultVoiceNameFor, and any
+//      │    voice of the primary's own language counts as an echo): routing fires
 //      │      packageManager.getNameForUid(request.callerUid) ──► pkg?
 //      │      TtsRouter.resolveAlias(pkg)  (suspend, runBlocking)
 //      │        ├── per-app mapping (com.spotify → "narrator") wins, OR
@@ -873,14 +874,18 @@ class MarmaladeTtsService : TextToSpeechService() {
      *      **deliberate pick** — engine-default speed (1.0×) and no
      *      effect, because the caller asked for that exact voice. A
      *      requested voice is NOT deliberate when it merely echoes what
-     *      we advertise as the default: the current primary alias's voice,
-     *      the catalog default while a primary exists, or any English
-     *      default this engine has advertised before
-     *      ([SettingsRepository.advertisedDefaultVoiceIds]) — clients
+     *      the engine presents as the default: any voice of the primary
+     *      alias's own language, the primary's exact voice, or — when a
+     *      language can't be resolved — the baked Kitten default and any
+     *      English default this engine has advertised before
+     *      ([SettingsRepository.advertisedDefaultVoiceIds]). Clients
      *      auto-fill and cache `voiceName` from
-     *      [onGetDefaultVoiceNameFor] / system Settings, so a value stamped
-     *      before the user changed the primary alias's voice would
-     *      otherwise outrank the new primary forever.
+     *      [onGetDefaultVoiceNameFor] / system Settings (or their own
+     *      saved picker row), so a value stamped before the user changed
+     *      the primary alias's voice would otherwise outrank the new
+     *      primary forever. A voice of a *different* language is the
+     *      multilingual negotiation — a French request must not be read
+     *      by an English-shaped primary — and keeps winning.
      *   3. Primary alias — same fields from the user-designated primary.
      *      Also taken when the caller requested exactly the primary's
      *      voice, so the alias's speed/effect ride along.
@@ -917,13 +922,13 @@ class MarmaladeTtsService : TextToSpeechService() {
             // caller-supplied voiceName is a deliberate pick or an
             // auto-filled echo of our advertised default.
             val primary: VoiceAlias? = router.resolveAlias(callerPackage)
-            // Every English default this engine has ever advertised. A
-            // client that cached one keeps stamping it after the user
-            // changes the primary alias's voice, and it must not read as a
-            // deliberate pick — that was "system TTS keeps speaking the
-            // voice I picked first". (Non-English defaults are not
-            // recorded: those name a voice of the requested language and
-            // must keep winning over the English-shaped primary.)
+            // English defaults this engine has advertised before. Only a
+            // fallback now (the primary's language decides, see
+            // [requestedVoiceIsAnEcho]); it covers voices whose catalog
+            // language we can't resolve. A client that cached one keeps
+            // stamping it after the user changes the primary alias's
+            // voice — "system TTS keeps speaking the voice I picked
+            // first".
             val advertisedDefaults = settings.advertisedDefaultVoiceIds.first()
 
             // 2. Caller-specified voice, when deliberate (see kdoc). With
@@ -931,11 +936,17 @@ class MarmaladeTtsService : TextToSpeechService() {
             // nothing for the auto-fill to mask. Cache-first so the common
             // "request specifies a voice that was seeded at install" path
             // stays off the synth-worker's blocking road.
+            val requestedLanguage = requested?.let(::voiceLanguageOf)
+            val primaryLanguage = primary?.let { voiceLanguageOf(it.voiceId) }
             val deliberate = requested != null && (
                 primary == null ||
-                    (requested != primary.voiceId &&
-                        requested != KittenDirectVoiceCatalog.DEFAULT_VOICE_ID &&
-                        requested !in advertisedDefaults)
+                    !requestedVoiceIsAnEcho(
+                        requested = requested,
+                        primary = primary,
+                        requestedLanguage = requestedLanguage,
+                        primaryLanguage = primaryLanguage,
+                        advertisedDefaults = advertisedDefaults,
+                    )
                 )
             if (requested != null && deliberate) {
                 val cachedEngine = voiceEngineCache[requested]?.engine
@@ -960,10 +971,10 @@ class MarmaladeTtsService : TextToSpeechService() {
             // 3. Primary alias fallback.
             if (primary != null) {
                 // Remember the alias's voice as a default echo too, not only
-                // when onGetDefaultVoiceNameFor advertises it: this also
-                // covers an upgrade from a build that recorded nothing, so
-                // changing the alias's voice later still wins over a client
-                // that cached the old one. Writes only when it is new.
+                // when onGetDefaultVoiceNameFor advertises it: this feeds the
+                // language-free fallback in [requestedVoiceIsAnEcho] for a
+                // client that cached a voice whose catalog language we can't
+                // resolve. Writes only when it is new.
                 if (primary.voiceId !in advertisedDefaults) {
                     settings.recordAdvertisedDefaultVoice(primary.voiceId)
                 }
@@ -995,6 +1006,59 @@ class MarmaladeTtsService : TextToSpeechService() {
                 effectBlocks = emptyList(),
             ),
         )
+    }
+
+    /**
+     * True when [requested] merely echoes what the engine itself presented
+     * rather than being a caller's deliberate pick.
+     *
+     * The **language decides it** whenever both voices name one: a request
+     * for a voice of the primary alias's own language is the system default
+     * coming back. Clients cache `voiceName` from
+     * [onGetDefaultVoiceNameFor], Android's Settings picker, or their own
+     * saved voice row, and keep stamping it after the user rewires the
+     * primary — that was "system TTS keeps speaking the first voice I
+     * picked", still reproducing on a Boox reader in Chinese because the
+     * earlier fix only recognised English defaults. A voice of a
+     * *different* language is the multilingual negotiation (a French
+     * request must not be read by an English-shaped primary), so it stays
+     * a pick and wins.
+     *
+     * When either language is unknown, fall back to the language-free
+     * heuristic: the primary's exact voice, the baked Kitten default, and
+     * any English default the engine has advertised before
+     * ([SettingsRepository.advertisedDefaultVoiceIds]).
+     */
+    private fun requestedVoiceIsAnEcho(
+        requested: String,
+        primary: VoiceAlias,
+        requestedLanguage: String?,
+        primaryLanguage: String?,
+        advertisedDefaults: Set<String>,
+    ): Boolean {
+        if (requested == primary.voiceId) return true
+        if (requestedLanguage != null && primaryLanguage != null) {
+            return requestedLanguage == primaryLanguage
+        }
+        return requested == KittenDirectVoiceCatalog.DEFAULT_VOICE_ID ||
+            requested in advertisedDefaults
+    }
+
+    /**
+     * Catalog language of [voiceId] as an ISO-639-1 code (`zh-CN` → `zh`),
+     * or null when the catalog doesn't know the voice. Snapshot-first; the
+     * cold-start fallback is one blocking DAO read, the same defensive
+     * pattern [onLoadVoice] uses, and callers already run inside a
+     * runBlocking on the synth worker.
+     */
+    private fun voiceLanguageOf(voiceId: String): String? {
+        val code = voiceSnapshot.firstOrNull { it.id == voiceId }?.languageCode
+            ?: runBlocking { voiceDao.findById(voiceId) }?.languageCode
+            ?: return null
+        return TtsLocales.toIso2Language(code)
+            ?: TtsLocales.toIso2Language(
+                code.substringBefore('-').substringBefore('_'),
+            )
     }
 
     /**

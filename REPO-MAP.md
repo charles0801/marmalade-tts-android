@@ -980,7 +980,7 @@ and `MarmaladeSynthService` is its foreground host. System TTS
   `"api": "azure"` and a regional `baseUrl` template
   `https://{region}.tts.speech.microsoft.com` with `"needsRegion": true`;
   the user's region (entered with the key) is stored in the same
-  `cloud_api_key_base_url_<id>` pref as the saved URL, and
+  `cloud_key_base_url_<id>` pref as the saved URL, and
   `CloudProvider.endpoint()` is null until then. `sameSite` substitutes
   the region token before comparing, so the site pin still works.
   Azure discovery parses `/cognitiveservices/voices/list` into the
@@ -1310,17 +1310,24 @@ its pre-#96 path**: each check is `sentencePauseMs > 0`, pinned by
   `onGetLanguage`, `onLoadVoice`
   - **Voice precedence** in `resolveSynthParams`: per-app mapping →
     deliberate `request.voiceName` pick → primary alias → engine default.
-    A requested voice is an **auto-fill echo**, not a pick, when it equals
-    the primary's current voice, the Kitten default, or **any English
-    default this engine has presented before**
+    The **language decides** whether a requested voice is a pick or an
+    **auto-fill echo**: any voice of the primary alias's own language is
+    treated as an echo and yields to the primary
+    (`requestedVoiceIsAnEcho`). Clients cache `voiceName` — from
+    `onGetDefaultVoiceNameFor`, Android's Settings picker, or their own
+    saved row — and keep stamping it after the user changes the primary,
+    so without this "system TTS always speaks the first voice I chose"
+    (reported in English first, then Chinese on a Boox Leaf reader,
+    2026-10-31: it stamped the old zh-CN voice forever because the first
+    fix only recognised English defaults). A requested voice of a
+    **different** language is the multilingual negotiation (French text
+    must not be read by an English-shaped primary) and still wins.
+    When either voice's catalog language is unknown, the fallback
+    heuristic applies: the primary's exact voice, the Kitten default, or
+    any English default this engine has presented before
     (`SettingsRepository.advertisedDefaultVoiceIds`, recorded when
     `onGetDefaultVoiceNameFor` answers and whenever the primary alias
-    speaks; persisted). Without that last set, a client that cached the
-    advertised default keeps stamping the voice the primary alias used to
-    have after the user changes it, and the old voice outranks the new
-    primary forever ("system TTS always speaks the first voice I chose").
-    Non-English defaults are never recorded: those name a voice of the
-    requested language and must beat the English-shaped primary.
+    speaks; persisted).
 - `service/CheckVoiceDataActivity.kt` — Android invokes this to
   enumerate installed voices (BCP-47 → ISO-639-3 conversion). Filters
   through `MarmaladeTtsService.advertisableVoices`, the same rule the
