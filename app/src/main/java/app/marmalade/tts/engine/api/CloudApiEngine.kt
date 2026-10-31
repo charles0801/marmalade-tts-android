@@ -3,6 +3,8 @@ package app.marmalade.tts.engine.api
 import app.marmalade.tts.audio.TextChunker
 import app.marmalade.tts.data.CloudApiVoiceCatalog
 import app.marmalade.tts.data.SettingsRepository
+import app.marmalade.tts.data.cloud.AzureSpeech
+import app.marmalade.tts.data.cloud.CloudApiStyle
 import app.marmalade.tts.data.cloud.CloudProviderDirectory
 import app.marmalade.tts.engine.EngineNotInstalledException
 import app.marmalade.tts.engine.SynthAudio
@@ -13,6 +15,7 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.Locale
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.Dispatchers
@@ -24,13 +27,22 @@ import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.runBlocking
 
 /**
- * Cloud API engine — synthesis over an OpenAI-compatible `/audio/speech`
- * endpoint. Nothing runs on-device: the request carries text + model +
- * voice + speed, the response is a WAV byte stream. One engine covers
- * every provider that speaks this shape (Venice, OpenAI, …): the voice id
- * names the provider + model (`cloud-api-v1:<provider>:<model>:<voice>`)
- * and [CloudProviderDirectory] supplies the provider's base URL, so adding a
- * provider is data, not code.
+ * Cloud API engine — synthesis over a hosted provider's HTTP API. Nothing
+ * runs on-device: the request carries text + voice + speed and the response
+ * is an audio byte stream. One engine covers every provider, in either of
+ * the two wire styles [CloudApiStyle] names:
+ *
+ *  - [CloudApiStyle.OPENAI] — an OpenAI-compatible `/audio/speech` endpoint
+ *    (Venice, OpenAI, …): a JSON body, `Authorization: Bearer`, a WAV or
+ *    MP3 response.
+ *  - [CloudApiStyle.AZURE] — Azure AI Speech's
+ *    `POST {endpoint}/cognitiveservices/v1`: an SSML body,
+ *    `Ocp-Apim-Subscription-Key`, and `riff-24khz-16bit-mono-pcm` output.
+ *
+ * The voice id names the provider + model
+ * (`cloud-api-v1:<provider>:<model>:<voice>`) and
+ * [CloudProviderDirectory] supplies the provider's endpoint and style, so
+ * adding a provider is data, not code.
  *
  * Latency: with `"streaming": true` Venice sends the first audio bytes in
  * ~0.6 s while synthesis continues server-side, so [synthesizeStream]
@@ -38,7 +50,8 @@ import kotlinx.coroutines.runBlocking
  * round trip, independent of utterance length. Only some models actually
  * stream: measured 2026-07-24, Venice's Kokoro and Gradium send first
  * bytes well before synthesis completes, while every other model buffers
- * the whole utterance server-side (TTFB ≈ total).
+ * the whole utterance server-side (TTFB ≈ total). Azure sends the WAV as it
+ * synthesizes, so the same chunked emit applies.
  *
  * Port of the CLI's `marmalade_tts/engines/api.py`. Provider findings
  * that cost real debugging time and are easy to re-break:
@@ -52,12 +65,13 @@ import kotlinx.coroutines.runBlocking
  *    rate travels per-voice rather than per-engine.
  * Models that break the wire contract are kept out by the descriptor's
  * model allowlist (see CloudProviders); the WAV header check below is the
- * backstop if one slips through.
+ * backstop if one slips through. Azure has one output format regardless of
+ * voice, so its declared rate is fixed at 24 kHz.
  *
  * "Installed" means "an API key is configured"
  * ([SettingsRepository.cloudApiKeys]) — there is no bundle on disk and no
  * [app.marmalade.tts.install.EngineCatalog] entry. The key never leaves
- * the request's Authorization header and is never logged.
+ * the request's auth header(s) and is never logged.
  */
 @Singleton
 class CloudApiEngine @Inject constructor(
@@ -143,7 +157,11 @@ class CloudApiEngine @Inject constructor(
         if (key.isBlank()) throw EngineNotInstalledException(engineName)
         val provider = providers.providerById(ref.providerId)
             ?: throw IOException("Unknown cloud provider '${ref.providerId}' for $voiceId")
-        val baseUrl = provider.baseUrl
+        val endpoint = provider.endpoint()
+            ?: throw IOException(
+                "${provider.displayName} has no endpoint yet — set its key and " +
+                    "region in Engines → Cloud voices",
+            )
         // The rate this model is *declared* to emit. The service already
         // committed to exactly this value in callback.start() (it reads the
         // same number out of the voice row), so this is what the response
@@ -156,8 +174,11 @@ class CloudApiEngine @Inject constructor(
         // read is never rejected whole. flowOn's buffer lets the next
         // request start while the previous chunk's audio is still playing.
         for (chunk in requestChunks(text)) {
-            val body = requestJson(chunk, ref.modelId, ref.voice, speed)
-            http.post("$baseUrl/audio/speech", key, body).use { rawStream ->
+            val request = when (provider.api) {
+                CloudApiStyle.OPENAI -> openAiRequest(endpoint, key, chunk, ref, speed)
+                CloudApiStyle.AZURE -> azureRequest(endpoint, key, chunk, ref, speed)
+            }
+            http.post(request).use { rawStream ->
                 emitResponse(rawStream, expectedRate, ref.modelId)
             }
         }
@@ -255,6 +276,64 @@ class CloudApiEngine @Inject constructor(
         }
     }
 
+    /** An OpenAI-compatible `POST /audio/speech` request. */
+    private fun openAiRequest(
+        endpoint: String,
+        key: String,
+        text: String,
+        ref: CloudApiVoiceCatalog.CloudVoiceRef,
+        speed: Float,
+    ): CloudSpeechRequest = CloudSpeechRequest(
+        url = "$endpoint/audio/speech",
+        headers = mapOf(
+            "Authorization" to "Bearer $key",
+            "Content-Type" to "application/json",
+        ),
+        body = requestJson(text, ref.modelId, ref.voice, speed),
+    )
+
+    /**
+     * An Azure AI Speech request. The output format is fixed, so every voice
+     * comes back as 24 kHz mono PCM16 regardless of the rate it was trained
+     * at; the descriptor declares that rate.
+     */
+    private fun azureRequest(
+        endpoint: String,
+        key: String,
+        text: String,
+        ref: CloudApiVoiceCatalog.CloudVoiceRef,
+        speed: Float,
+    ): CloudSpeechRequest = CloudSpeechRequest(
+        url = "$endpoint/cognitiveservices/v1",
+        // The subscription key travels in its own header, not as a Bearer
+        // token. User-Agent is required by the service (< 255 chars).
+        headers = mapOf(
+            "Ocp-Apim-Subscription-Key" to key,
+            "Content-Type" to "application/ssml+xml",
+            "X-Microsoft-OutputFormat" to AZURE_OUTPUT_FORMAT,
+            "User-Agent" to AZURE_USER_AGENT,
+        ),
+        body = azureSsml(text, ref.voice, speed),
+    )
+
+    /**
+     * Azure SSML for one chunk. The voice's locale rides in `xml:lang`
+     * (derived from its ShortName: `en-US-JennyNeural` → `en-US`), and the
+     * speed becomes a `prosody` rate multiplier. Azure documents the rate
+     * range as 0.5–2× and substitutes values outside it, so it is clamped
+     * here rather than sent and silently altered.
+     */
+    internal fun azureSsml(text: String, voice: String, speed: Float): String {
+        val locale = AzureSpeech.localeOf(voice) ?: "en-US"
+        val rate = speed.coerceIn(AZURE_MIN_RATE, AZURE_MAX_RATE)
+        val rateText = String.format(Locale.ROOT, "%.2f", rate)
+        val name = escapeXml(voice)
+        return """<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" """ +
+            """xml:lang="$locale"><voice xml:lang="$locale" name="$name">""" +
+            """<prosody rate="$rateText">${escapeXml(text)}</prosody>""" +
+            "</voice></speak>"
+    }
+
     /**
      * Hand-built JSON — org.json is a throwing stub in JVM unit tests
      * (see EffectBlockJson), and this payload is six fields.
@@ -272,6 +351,19 @@ class CloudApiEngine @Inject constructor(
 
         /** Enough to tell RIFF from anything else. */
         private const val SNIFF_BYTES = 4
+
+        /**
+         * Azure's WAV output. Fixed at 24 kHz mono PCM16, so every voice is
+         * resampled to the descriptor's declared rate by the service.
+         */
+        private const val AZURE_OUTPUT_FORMAT = "riff-24khz-16bit-mono-pcm"
+
+        /** Required by Azure (< 255 chars); it is only an application name. */
+        private const val AZURE_USER_AGENT = "MarmaladeTTS"
+
+        /** Azure's documented prosody rate range; it substitutes outside it. */
+        internal const val AZURE_MIN_RATE = 0.5f
+        internal const val AZURE_MAX_RATE = 2.0f
 
         private fun isRiff(b: ByteArray): Boolean =
             b.size >= 4 && b[0] == 'R'.code.toByte() && b[1] == 'I'.code.toByte() &&
@@ -299,6 +391,22 @@ class CloudApiEngine @Inject constructor(
                 c == '\r' -> append("\\r")
                 c == '\t' -> append("\\t")
                 c < ' ' -> append("\\u%04x".format(c.code))
+                else -> append(c)
+            }
+        }
+
+        /**
+         * XML text/attribute escaping for Azure SSML. The text the user asked
+         * us to speak is arbitrary input, so every SSML-sensitive character
+         * must be escaped; `"` and `'` matter for the voice-name attribute.
+         */
+        internal fun escapeXml(s: String): String = buildString(s.length + 16) {
+            for (c in s) when (c) {
+                '&' -> append("&amp;")
+                '<' -> append("&lt;")
+                '>' -> append("&gt;")
+                '"' -> append("&quot;")
+                '\'' -> append("&apos;")
                 else -> append(c)
             }
         }
@@ -405,20 +513,31 @@ internal data class WavStreamHeader(
 }
 
 /**
+ * One synthesis HTTP request: everything that differs between the two wire
+ * styles is resolved before this reaches the network, so the transport stays
+ * a dumb POST. Callers supply `Content-Type` and the style's auth header.
+ */
+data class CloudSpeechRequest(
+    val url: String,
+    val headers: Map<String, String>,
+    /** UTF-8 request body: JSON or SSML. */
+    val body: String,
+)
+
+/**
  * Injectable seam for the synthesis POST so JVM unit tests can serve a
  * canned WAV without a network. Mirrors the installer's
  * [app.marmalade.tts.install.HttpFetcher] pattern.
  */
 fun interface CloudSpeechHttp {
     /**
-     * POST [json] to [url] with `Authorization: Bearer` [apiKey]; return
-     * the (streaming) response body.
+     * POST [request]; return the (streaming) response body.
      *
      * @throws IOException on connection failure or a non-2xx status —
      *         the message carries the HTTP code and a fixed explanation,
      *         never the provider's response body. See [explainStatus].
      */
-    fun post(url: String, apiKey: String, json: String): InputStream
+    fun post(request: CloudSpeechRequest): InputStream
 }
 
 /**
@@ -434,7 +553,7 @@ fun interface CloudSpeechHttp {
  * code alone distinguishes every case the user can act on.
  */
 internal fun explainStatus(code: Int): String = when (code) {
-    401, 403 -> "the API key was rejected — check it in Engines → Cloud voices"
+    401, 403 -> "the API key or region was rejected — check it in Engines → Cloud voices"
     402 -> "the provider reports no remaining credit"
     404 -> "the provider does not offer this model or voice"
     413 -> "the text is too long for this provider"
@@ -445,16 +564,15 @@ internal fun explainStatus(code: Int): String = when (code) {
 
 /** Production [CloudSpeechHttp] on HttpURLConnection (no extra deps). */
 class UrlCloudSpeechHttp @Inject constructor() : CloudSpeechHttp {
-    override fun post(url: String, apiKey: String, json: String): InputStream {
-        val conn = (URL(url).openConnection() as HttpURLConnection).apply {
+    override fun post(request: CloudSpeechRequest): InputStream {
+        val conn = (URL(request.url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = 15_000
             readTimeout = 60_000
             doOutput = true
-            setRequestProperty("Authorization", "Bearer $apiKey")
-            setRequestProperty("Content-Type", "application/json")
+            for ((name, value) in request.headers) setRequestProperty(name, value)
         }
-        conn.outputStream.use { it.write(json.toByteArray()) }
+        conn.outputStream.use { it.write(request.body.toByteArray(Charsets.UTF_8)) }
         val code = conn.responseCode
         if (code !in 200..299) {
             // Drain and drop the error body rather than reading it: the

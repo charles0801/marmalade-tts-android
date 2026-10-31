@@ -46,7 +46,7 @@ class CloudApiViewModelTest {
     private class RecordingHttp : CloudJsonHttp {
         val urls = CopyOnWriteArrayList<String>()
         val firstCall = CountDownLatch(1)
-        override fun get(url: String, apiKey: String?): String {
+        override fun get(url: String, headers: Map<String, String>): String {
             urls += url
             firstCall.countDown()
             throw IOException("offline test")

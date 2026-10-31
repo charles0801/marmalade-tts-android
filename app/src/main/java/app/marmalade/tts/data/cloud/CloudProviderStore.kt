@@ -24,17 +24,21 @@ import org.json.JSONException
 //     │              ◄── assets/cloud-providers.json     (bundled fallback; also
 //     │                   pins each built-in provider's baseUrl to its site)
 //     │              ◄── SettingsRepository.cloudApiKeyBaseUrls (pins each
-//     │                   keyed provider to the site its key was saved for)
+//     │                   keyed provider to the site its key was saved for;
+//     │                   for a regional provider this URL also supplies the
+//     │                   active endpoint — CloudProvider.resolvedBaseUrl)
 //     │              + per-provider discovery overlay
 //     │                 (filesDir/cloud/voices-<id>.json, written by
-//     │                  discoverVoices() from GET {baseUrl}/models?type=tts)
+//     │                  discoverVoices() from the provider's own list path:
+//     │                   GET {baseUrl}/models?type=tts    (OpenAI-shaped)
+//     │                   GET {endpoint}/cognitiveservices/voices/list (Azure))
 //     ▼
 //   sync() ──► VoiceMeta rows for every keyed provider's models × voices
 //              ──► voiceDao.replaceEngine("cloud-api-v1", rows)
 //
 //   Update paths (all data, no app release):
 //     - provider added/changed  → refreshProviders() pulls the remote JSON
-//     - provider catalog drift  → discoverVoices() re-queries /models
+//     - provider catalog drift  → discoverVoices() re-queries the list path
 // -----------------------------------------------------------------------------
 
 /**
@@ -46,7 +50,7 @@ import org.json.JSONException
  * ([REMOTE_PROVIDERS_URL]) — so supporting a new provider, or Venice
  * reshuffling its catalog, never requires an app update. Voice lists for
  * providers that support it come from live discovery against the
- * provider's `/models?type=tts`; both fetches are cached under
+ * provider's list path ([CloudApiStyle]); both fetches are cached under
  * `filesDir/cloud/` so the app works offline with the last-known state.
  *
  * The remote list is trusted input with a limit: it may add providers and
@@ -54,7 +58,10 @@ import org.json.JSONException
  * provider's `baseUrl` (which receives the user's saved API key) within
  * that provider's own site — [CloudProviders.pinBuiltInSites] — and any
  * provider the user saved a key for within the site of the URL the key was
- * saved for — [CloudProviders.pinKeyedSites]. Process
+ * saved for — [CloudProviders.pinKeyedSites]. For a regional provider that
+ * saved URL is also the active endpoint: the user picks the region with
+ * the key, and it is stored in the same place — see [CloudProvider.endpoint].
+ * Process
  * rule (Max): any change to `cloud-providers.json` in the engines repo
  * needs Max's manual review; agents never merge it.
  */
@@ -91,7 +98,7 @@ class CloudProviderStore @Inject constructor(
             val cache = voicesCacheFile(provider.id)
             if (!cache.exists()) return@map provider
             val discovered = runCatching {
-                CloudProviders.parseDiscoveredModels(cache.readText())
+                CloudProviders.parseDiscovery(provider, cache.readText())
             }.getOrElse { emptyList() }
             if (discovered.isEmpty()) {
                 provider
@@ -111,6 +118,16 @@ class CloudProviderStore @Inject constructor(
         providers().firstOrNull { it.id == id }
 
     /**
+     * Drop the merged descriptor cache. Call after changing anything
+     * [providers] derives from settings (a key or its recorded URL, which is
+     * where a regional provider's endpoint comes from), so the next
+     * [providers] sees it.
+     */
+    fun invalidate() {
+        cached = null
+    }
+
+    /**
      * Fetch the provider list from the engines repo and cache it. Quietly
      * a no-op on any network/parse failure — the bundled (or previously
      * cached) descriptors stay in force. Returns true when a valid new
@@ -118,7 +135,7 @@ class CloudProviderStore @Inject constructor(
      */
     suspend fun refreshProviders(): Boolean = withContext(Dispatchers.IO) {
         val body = try {
-            http.get(REMOTE_PROVIDERS_URL, apiKey = null)
+            http.get(REMOTE_PROVIDERS_URL, emptyMap())
         } catch (e: IOException) {
             Log.i(TAG, "provider list refresh skipped: ${e.message}")
             return@withContext false
@@ -142,21 +159,38 @@ class CloudProviderStore @Inject constructor(
 
     /**
      * Query [provider]'s live model+voice list and cache it, then re-sync
-     * the Room rows. The key is optional — Venice serves the model list
-     * unauthenticated — but is sent when configured.
+     * the Room rows. The key is optional for an OpenAI-shaped provider
+     * (Venice serves the model list unauthenticated) and required by Azure;
+     * it is sent when configured, in that provider's own header.
      */
     suspend fun discoverVoices(provider: CloudProvider): Result<List<CloudModel>> =
         withContext(Dispatchers.IO) {
+            val endpoint = provider.endpoint()
+                ?: return@withContext Result.failure(
+                    IOException("${provider.displayName}: set a region with the API key"),
+                )
             val key = settings.cloudApiKeyFor(provider.id).first().ifBlank { null }
+            val url: String
+            val headers: Map<String, String>
+            when (provider.api) {
+                CloudApiStyle.OPENAI -> {
+                    url = "$endpoint/models?type=tts"
+                    headers = key?.let { mapOf("Authorization" to "Bearer $it") } ?: emptyMap()
+                }
+                CloudApiStyle.AZURE -> {
+                    url = "$endpoint/cognitiveservices/voices/list"
+                    headers = key?.let { mapOf("Ocp-Apim-Subscription-Key" to it) } ?: emptyMap()
+                }
+            }
             val body = try {
-                http.get("${provider.baseUrl}/models?type=tts", key)
+                http.get(url, headers)
             } catch (e: IOException) {
                 return@withContext Result.failure(e)
             } catch (e: SecurityException) {
                 return@withContext Result.failure(e)
             }
             val discovered = try {
-                CloudProviders.parseDiscoveredModels(body)
+                CloudProviders.parseDiscovery(provider, body)
             } catch (e: JSONException) {
                 return@withContext Result.failure(e)
             }
@@ -164,9 +198,9 @@ class CloudProviderStore @Inject constructor(
             // everything the provider advertises — Venice lists 11 TTS models
             // and only the allowlisted ones reach the picker.
             val models = CloudProviders.mergeDiscovered(provider.models, discovered)
-            if (models.isEmpty()) {
+            if (models.none { it.voices.isNotEmpty() }) {
                 return@withContext Result.failure(
-                    IOException("${provider.displayName} listed no usable TTS models"),
+                    IOException("${provider.displayName} listed no usable TTS voices"),
                 )
             }
             voicesCacheFile(provider.id).writeText(body)
@@ -267,22 +301,37 @@ class CloudProviderStore @Inject constructor(
         val (keys, saved) = runBlocking {
             settings.cloudApiKeys.first() to settings.cloudApiKeyBaseUrls.first()
         }
+        // A regional provider has no usable baseUrl until a region picks one,
+        // so there is nothing meaningful to record "on first use" — a saved
+        // key for it predates the region field and will ask for one again.
         val unrecorded = providers
-            .filter { !keys[it.id].isNullOrBlank() && it.id !in saved }
+            .filter {
+                !keys[it.id].isNullOrBlank() && it.id !in saved &&
+                    !it.needsRegion && it.baseUrl.isNotBlank()
+            }
             .associate { it.id to it.baseUrl }
         if (unrecorded.isNotEmpty()) {
             Log.i(TAG, "recording key URLs for ${unrecorded.keys} (first use)")
             runBlocking { settings.recordCloudApiKeyBaseUrls(unrecorded) }
         }
+        val keyUrls = saved + unrecorded
         val listed = providers.associateBy { it.id }
-        return CloudProviders.pinKeyedSites(bundled, providers, saved + unrecorded).onEach {
-            val listedUrl = listed.getValue(it.id).baseUrl
-            if (it.movedOffSite && it.baseUrl != listedUrl) {
+        return CloudProviders.pinKeyedSites(bundled, providers, keyUrls).map { provider ->
+            val listedUrl = listed.getValue(provider.id).baseUrl
+            if (provider.movedOffSite && provider.baseUrl != listedUrl) {
                 Log.w(
                     TAG,
-                    "provider list moves keyed ${it.id} off-site to $listedUrl; " +
-                        "refused, keeping ${it.baseUrl} where its key was saved",
+                    "provider list moves keyed ${provider.id} off-site to $listedUrl; " +
+                        "refused, keeping ${provider.baseUrl} where its key was saved",
                 )
+            }
+            // The URL recorded with the key is exactly where the key was
+            // agreed to go, and for a regional provider it also carries the
+            // region — so it is the active endpoint, not a site to compare.
+            if (provider.needsRegion) {
+                keyUrls[provider.id]?.let { provider.copy(resolvedBaseUrl = it) } ?: provider
+            } else {
+                provider
             }
         }
     }
@@ -317,20 +366,24 @@ fun interface CloudProviderDirectory {
  * Injectable seam for the store's GET requests (provider list refresh +
  * voice discovery) so tests serve canned JSON. Mirrors
  * [app.marmalade.tts.engine.api.CloudSpeechHttp].
+ *
+ * Headers are supplied by the caller because the two API styles
+ * authenticate differently: `Authorization: Bearer` for an OpenAI-shaped
+ * provider, `Ocp-Apim-Subscription-Key` for Azure.
  */
 fun interface CloudJsonHttp {
-    /** GET [url], optionally with `Authorization: Bearer` [apiKey]. */
+    /** GET [url] with [headers]; return the body. */
     @Throws(IOException::class)
-    fun get(url: String, apiKey: String?): String
+    fun get(url: String, headers: Map<String, String>): String
 }
 
 /** Production [CloudJsonHttp] on HttpURLConnection (no extra deps). */
 class UrlCloudJsonHttp @Inject constructor() : CloudJsonHttp {
-    override fun get(url: String, apiKey: String?): String {
+    override fun get(url: String, headers: Map<String, String>): String {
         val conn = (java.net.URL(url).openConnection() as java.net.HttpURLConnection).apply {
             connectTimeout = 10_000
             readTimeout = 30_000
-            if (apiKey != null) setRequestProperty("Authorization", "Bearer $apiKey")
+            for ((name, value) in headers) setRequestProperty(name, value)
         }
         try {
             val code = conn.responseCode

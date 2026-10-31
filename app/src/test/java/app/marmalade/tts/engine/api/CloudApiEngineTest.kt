@@ -5,9 +5,11 @@ import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.core.emptyPreferences
 import app.marmalade.tts.data.CloudApiVoiceCatalog
 import app.marmalade.tts.data.SettingsRepository
+import app.marmalade.tts.data.cloud.CloudApiStyle
 import app.marmalade.tts.data.cloud.CloudModel
 import app.marmalade.tts.data.cloud.CloudProvider
 import app.marmalade.tts.data.cloud.CloudProviderDirectory
+import app.marmalade.tts.data.cloud.CloudVoiceInfo
 import app.marmalade.tts.engine.EngineNotInstalledException
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
@@ -74,17 +76,34 @@ private val FAKE_DIRECTORY = CloudProviderDirectory { id ->
     VENICE.takeIf { id == "venice" }
 }
 
+private val AZURE = CloudProvider(
+    id = "azure",
+    displayName = "Azure Speech",
+    baseUrl = "https://{region}.tts.speech.microsoft.com",
+    keyHint = "portal.azure.com",
+    discoverVoices = true,
+    models = listOf(CloudModel("neural", "Neural voices", emptyList(), sampleRate = 24_000)),
+    api = CloudApiStyle.AZURE,
+    needsRegion = true,
+    resolvedBaseUrl = "https://eastus.tts.speech.microsoft.com",
+)
+
+private val AZURE_DIRECTORY = CloudProviderDirectory { id ->
+    AZURE.takeIf { id == "azure" }
+}
+
 /** Serves a canned response and records the request. */
 private class FakeHttp(private val response: () -> InputStream) : CloudSpeechHttp {
-    var lastUrl: String? = null
-    var lastKey: String? = null
-    var lastJson: String? = null
-    val allJson = mutableListOf<String>()
-    override fun post(url: String, apiKey: String, json: String): InputStream {
-        lastUrl = url
-        lastKey = apiKey
-        lastJson = json
-        allJson.add(json)
+    var lastRequest: CloudSpeechRequest? = null
+    val allRequests = mutableListOf<CloudSpeechRequest>()
+
+    val lastUrl: String? get() = lastRequest?.url
+    val lastBody: String? get() = lastRequest?.body
+    val lastHeaders: Map<String, String> get() = lastRequest?.headers ?: emptyMap()
+
+    override fun post(request: CloudSpeechRequest): InputStream {
+        lastRequest = request
+        allRequests += request
         return response()
     }
 }
@@ -148,6 +167,20 @@ private fun engine(
     decoder: CompressedAudioDecoder = REJECTING_DECODER,
 ) = CloudApiEngine(FakeKeySettings("venice" to key), FAKE_DIRECTORY, http, decoder)
 
+private fun azureEngine(
+    key: String = "azure-key",
+    provider: CloudProvider = AZURE,
+    http: CloudSpeechHttp = FakeHttp { ByteArrayInputStream(wavBytes(ShortArray(10))) },
+) = CloudApiEngine(
+    FakeKeySettings("azure" to key),
+    CloudProviderDirectory { id -> provider.takeIf { id == "azure" } },
+    http,
+    REJECTING_DECODER,
+)
+
+private fun azureVoice(voice: String = "en-US-JennyNeural"): String =
+    CloudApiVoiceCatalog.voiceId("azure", "neural", voice)
+
 // -----------------------------------------------------------------------------
 // Tests
 // -----------------------------------------------------------------------------
@@ -165,8 +198,9 @@ class CloudApiEngineTest {
         assertEquals(24000, audio.sampleRate)
         assertTrue(audio.pcm.contentEquals(samples))
         assertEquals("${VENICE.baseUrl}/audio/speech", http.lastUrl)
-        assertEquals("test-key", http.lastKey)
-        val json = http.lastJson!!
+        assertEquals("Bearer test-key", http.lastHeaders["Authorization"])
+        assertEquals("application/json", http.lastHeaders["Content-Type"])
+        val json = http.lastBody!!
         assertTrue(json.contains("\"model\":\"tts-kokoro\""))
         assertTrue(json.contains("\"input\":\"hello there\""))
         assertTrue(json.contains("\"voice\":\"af_heart\""))
@@ -180,8 +214,8 @@ class CloudApiEngineTest {
         val http = FakeHttp { ByteArrayInputStream(wavBytes(ShortArray(4))) }
         engine(http = http).synthesize("x", "cloud-api-v1:af_sky", 1.0f)
         assertEquals("${VENICE.baseUrl}/audio/speech", http.lastUrl)
-        assertTrue(http.lastJson!!.contains("\"model\":\"tts-kokoro\""))
-        assertTrue(http.lastJson!!.contains("\"voice\":\"af_sky\""))
+        assertTrue(http.lastBody!!.contains("\"model\":\"tts-kokoro\""))
+        assertTrue(http.lastBody!!.contains("\"voice\":\"af_sky\""))
     }
 
     @Test
@@ -206,7 +240,7 @@ class CloudApiEngineTest {
     fun `speed is clamped to provider range`() = runTest {
         val http = FakeHttp { ByteArrayInputStream(wavBytes(ShortArray(4))) }
         engine(http = http).synthesize("x", voiceId, 9.0f)
-        assertTrue(http.lastJson!!.contains("\"speed\":4.0"))
+        assertTrue(http.lastBody!!.contains("\"speed\":4.0"))
     }
 
     @Test
@@ -272,14 +306,14 @@ class CloudApiEngineTest {
         val eng = engine(http = http)
         val chunks = eng.synthesizeStream(text, voiceId, 1.0f).toList()
 
-        assertTrue("expected several requests, got ${http.allJson.size}", http.allJson.size > 4)
-        val inputs = http.allJson.map {
-            it.substringAfter("\"input\":\"").substringBefore("\",\"voice\"")
+        assertTrue("expected several requests, got ${http.allRequests.size}", http.allRequests.size > 4)
+        val inputs = http.allRequests.map {
+            it.body.substringAfter("\"input\":\"").substringBefore("\",\"voice\"")
         }
         assertTrue(inputs.all { it.length <= eng.maxInputChars })
         assertEquals(text, inputs.joinToString(" "))
         // One emission per request, in request order, each starting a sentence.
-        assertEquals((1..http.allJson.size).toList(), chunks.map { it.pcm[0].toInt() })
+        assertEquals((1..http.allRequests.size).toList(), chunks.map { it.pcm[0].toInt() })
         assertTrue(chunks.all { it.resumePoint })
     }
 
@@ -418,6 +452,74 @@ class CloudApiEngineTest {
         assertEquals("\\u0001", CloudApiEngine.escapeJson("\u0001"))
         assertEquals("back\\\\slash", CloudApiEngine.escapeJson("back\\slash"))
     }
+
+    // --- Azure AI Speech (CloudApiStyle.AZURE) ---
+
+    @Test
+    fun `azure posts SSML to the regional endpoint with its own headers`() = runTest {
+        val http = FakeHttp { ByteArrayInputStream(wavBytes(ShortArray(8))) }
+        azureEngine(http = http).synthesize("hello there", azureVoice(), 1.5f)
+
+        assertEquals("https://eastus.tts.speech.microsoft.com/cognitiveservices/v1", http.lastUrl)
+        // The subscription key travels in its own header, not as a Bearer token.
+        assertEquals("azure-key", http.lastHeaders["Ocp-Apim-Subscription-Key"])
+        assertNull(http.lastHeaders["Authorization"])
+        assertEquals("application/ssml+xml", http.lastHeaders["Content-Type"])
+        assertEquals("riff-24khz-16bit-mono-pcm", http.lastHeaders["X-Microsoft-OutputFormat"])
+        assertTrue(http.lastHeaders["User-Agent"].orEmpty().isNotEmpty())
+
+        val ssml = http.lastBody!!
+        assertTrue(ssml.startsWith("<speak"))
+        assertTrue(ssml.contains("xml:lang=\"en-US\""))
+        assertTrue(ssml.contains("name=\"en-US-JennyNeural\""))
+        assertTrue(ssml.contains("<prosody rate=\"1.50\">hello there</prosody>"))
+    }
+
+    @Test
+    fun `azure escapes the text as xml`() = runTest {
+        val http = FakeHttp { ByteArrayInputStream(wavBytes(ShortArray(4))) }
+        azureEngine(http = http).synthesize("A & B < C \"quote\"", azureVoice(), 1f)
+        val ssml = http.lastBody!!
+        assertTrue(ssml.contains("A &amp; B &lt; C &quot;quote&quot;"))
+        assertTrue(!ssml.contains("A & B"))
+    }
+
+    @Test
+    fun `azure speed is clamped to its prosody range`() = runTest {
+        for ((requested, expected) in listOf(9f to "2.00", 0.1f to "0.50", 1.25f to "1.25")) {
+            val http = FakeHttp { ByteArrayInputStream(wavBytes(ShortArray(4))) }
+            azureEngine(http = http).synthesize("x", azureVoice(), requested)
+            assertTrue(
+                "speed $requested should send $expected",
+                http.lastBody!!.contains("rate=\"$expected\""),
+            )
+        }
+    }
+
+    @Test
+    fun `azure without a region fails before any request`() = runTest {
+        val http = FakeHttp { fail("no request expected"); throw AssertionError() }
+        try {
+            azureEngine(provider = AZURE.copy(resolvedBaseUrl = null), http = http)
+                .synthesize("x", azureVoice(), 1f)
+            fail("expected IOException")
+        } catch (e: IOException) {
+            assertTrue(e.message!!.contains("region"))
+        }
+        assertNull(http.lastRequest)
+    }
+
+    @Test
+    fun `an azure hd voice id keeps its colon out of the id separators`() = runTest {
+        // DragonHD ShortNames are `en-US-Ava:DragonHDLatestNeural`; a raw colon
+        // would make parseVoiceId see five parts and reject the alias.
+        val voice = azureVoice("en-US-Ava:DragonHDLatestNeural")
+        assertEquals("en-US-Ava:DragonHDLatestNeural", CloudApiVoiceCatalog.parseVoiceId(voice)!!.voice)
+
+        val http = FakeHttp { ByteArrayInputStream(wavBytes(ShortArray(4))) }
+        azureEngine(http = http).synthesize("x", voice, 1f)
+        assertTrue(http.lastBody!!.contains("name=\"en-US-Ava:DragonHDLatestNeural\""))
+    }
 }
 
 class CloudApiVoiceCatalogTest {
@@ -469,5 +571,52 @@ class CloudApiVoiceCatalogTest {
 
         val kokoro = VENICE.models.first { it.id == "tts-kokoro" }
         assertEquals(24_000, CloudApiVoiceCatalog.voiceMeta(VENICE, kokoro, "af_heart").sampleRate)
+    }
+
+    @Test
+    fun `voice ids escape a colon in the voice name`() {
+        val id = CloudApiVoiceCatalog.voiceId("azure", "neural", "en-US-Ava:DragonHDLatestNeural")
+        // Still the four-segment scheme: the separator count is what
+        // parseVoiceId keys on.
+        assertEquals(4, id.split(':').size)
+        assertEquals("en-US-Ava:DragonHDLatestNeural", CloudApiVoiceCatalog.parseVoiceId(id)!!.voice)
+    }
+
+    @Test
+    fun `azure voice rows use the disclosed name language and gender`() {
+        val model = AZURE.models.single().copy(
+            voices = listOf("en-US-JennyNeural"),
+            voiceInfo = mapOf(
+                "en-US-JennyNeural" to CloudVoiceInfo("Jenny", "en-US", "female"),
+            ),
+        )
+        val row = CloudApiVoiceCatalog.voiceMeta(AZURE, model, "en-US-JennyNeural")
+        assertEquals("Jenny", row.displayName)
+        assertEquals("en-US", row.languageCode)
+        assertEquals("female", row.gender)
+        assertEquals(24_000, row.sampleRate)
+        assertTrue(CloudApiVoiceCatalog.hasKnownLanguage(row.id))
+    }
+
+    @Test
+    fun `an azure short name yields its locale even without discovery metadata`() {
+        val row = CloudApiVoiceCatalog.voiceMeta(
+            AZURE, AZURE.models.single(), "zh-CN-liaoning-XiaobeiNeural",
+        )
+        assertEquals("zh-CN", row.languageCode)
+    }
+
+    @Test
+    fun `multilingual openai voices still report no known language`() {
+        assertTrue(
+            !CloudApiVoiceCatalog.hasKnownLanguage(
+                CloudApiVoiceCatalog.voiceId("openai", "tts-1", "alloy"),
+            ),
+        )
+        assertTrue(
+            CloudApiVoiceCatalog.hasKnownLanguage(
+                CloudApiVoiceCatalog.voiceId("venice", "tts-kokoro", "af_heart"),
+            ),
+        )
     }
 }

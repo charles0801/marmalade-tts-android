@@ -6,6 +6,7 @@ import androidx.lifecycle.viewModelScope
 import app.marmalade.tts.R
 import app.marmalade.tts.data.CloudApiVoiceCatalog
 import app.marmalade.tts.data.SettingsRepository
+import app.marmalade.tts.data.cloud.AzureSpeech
 import app.marmalade.tts.data.cloud.CloudProvider
 import app.marmalade.tts.data.cloud.CloudProviderStore
 import app.marmalade.tts.data.db.VoiceMetaDao
@@ -36,7 +37,7 @@ import kotlinx.coroutines.launch
 //     ├── busyIds / errors ◄── per-provider discovery state
 //     │
 //     └── actions
-//          ├── setKey(id, value)  → settings + store.sync() (+ discovery)
+//          ├── setKey(id, value, region) → settings + store.sync() (+ discovery)
 //          └── refreshVoices(id)  → store.discoverVoices(provider)
 // -----------------------------------------------------------------------------
 
@@ -115,15 +116,29 @@ class CloudApiViewModel @Inject constructor(
      * Save (or clear, when blank) a provider's key, resync the engine's
      * voices, and — for discovering providers just gaining a key — kick
      * off live discovery so the static fallback list gets superseded.
+     *
+     * [region] is required for a regional provider (Azure) and ignored
+     * otherwise: it picks the endpoint, which is stored with the key as the
+     * URL the key was saved for. A regional provider's request is refused
+     * here rather than sent to a guessed region.
      */
-    fun setKey(provider: CloudProvider, value: String) {
-        viewModelScope.launch {
+    fun setKey(provider: CloudProvider, value: String, region: String = "") {
+        if (value.isNotBlank() && provider.needsRegion && !AzureSpeech.isValidRegion(region)) return
+        viewModelScope.launch(Dispatchers.IO) {
             // The URL is the pin for a provider the app doesn't bundle
-            // (CloudProviders.pinKeyedSites): where the user agreed to send it.
-            settings.setCloudApiKey(provider.id, value, provider.baseUrl)
+            // (CloudProviders.pinKeyedSites): where the user agreed to send
+            // it. For a regional provider it also carries the region, which
+            // is how CloudProviderStore resolves the endpoint later.
+            val baseUrl = if (value.isBlank()) provider.baseUrl
+            else provider.endpointForRegion(region)
+            settings.setCloudApiKey(provider.id, value, baseUrl)
+            // The settings are what providers() derives the endpoint from,
+            // so the cache must go before the resync reads it.
+            store.invalidate()
             store.sync()
+            _providers.value = store.providers()
             if (value.isNotBlank() && provider.discoverVoices) {
-                refreshVoices(provider)
+                store.providers().firstOrNull { it.id == provider.id }?.let(::refreshVoices)
             }
         }
     }

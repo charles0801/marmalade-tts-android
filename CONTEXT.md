@@ -59,6 +59,23 @@ its entry here in the same change.
   speed; TalkBack reads the word. Grades are Max's listening judgement and
   agents never change them. Code: `QualityGrade` in `install/QualityGrade.kt`.
 
+## Cloud voices
+
+- **Cloud provider.** A hosted TTS service the user enables with their own
+  API key, described as data in `cloud-providers.json` (bundled and remotely
+  updatable). Code: `CloudProvider` in `data/cloud/CloudProviders.kt`.
+- **API style.** The wire protocol a provider speaks, named by its `"api"`
+  field: `openai` (an OpenAI-compatible `/audio/speech` endpoint) or `azure`
+  (Azure AI Speech's SSML endpoint). Code: `CloudApiStyle`.
+- **Regional provider.** A provider whose endpoint is per-region, so the
+  user enters a region with the key (Azure). The descriptor's `baseUrl` is
+  a template such as `https://{region}.tts.speech.microsoft.com`; the
+  region resolves it to the **endpoint** requests go to.
+- **Voice id.** `cloud-api-v1:<provider>:<model>:<voice>`, the scheme that
+  rides provider and model inside an ordinary voice id. The voice segment is
+  percent-escaped so a `:` in an Azure HD voice name can't split it. Code:
+  `CloudApiVoiceCatalog`.
+
 ## Builds and distribution
 
 - **Flavor.** `play` or `fdroid`: one app with one feature set, differing only

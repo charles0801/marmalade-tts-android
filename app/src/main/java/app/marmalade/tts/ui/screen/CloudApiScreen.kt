@@ -40,6 +40,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import app.marmalade.tts.R
+import app.marmalade.tts.data.cloud.AzureSpeech
 import app.marmalade.tts.data.cloud.CloudProvider
 import app.marmalade.tts.ui.components.MarmaladeCard
 
@@ -129,7 +130,7 @@ fun CloudApiContent(
         ProviderKeyDialog(
             provider = provider,
             keySet = provider.id in keyedIds,
-            onSave = { viewModel.setKey(provider, it) },
+            onSave = { key, region -> viewModel.setKey(provider, key, region) },
             onDismiss = { keyDialogFor = null },
         )
     }
@@ -346,15 +347,26 @@ private fun ProviderCard(
 /**
  * Per-provider key dialog. The stored key is never displayed back; the
  * field always starts empty ("Remove key" is the explicit way out).
+ *
+ * A regional provider ([CloudProvider.needsRegion], Azure) also asks for its
+ * region — the key is only valid in the region it was issued for, and the
+ * region picks the endpoint. It is prefilled from the URL the current key was
+ * saved for, so changing only the key doesn't require remembering it.
  */
 @Composable
 private fun ProviderKeyDialog(
     provider: CloudProvider,
     keySet: Boolean,
-    onSave: (String) -> Unit,
+    onSave: (key: String, region: String) -> Unit,
     onDismiss: () -> Unit,
 ) {
     var draft by remember { mutableStateOf("") }
+    var regionDraft by remember(provider.id) {
+        mutableStateOf(
+            provider.resolvedBaseUrl?.let(AzureSpeech::regionFromBaseUrl).orEmpty(),
+        )
+    }
+    val regionOk = !provider.needsRegion || AzureSpeech.isValidRegion(regionDraft)
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(stringResource(R.string.engines_cloud_key_dialog_title, provider.displayName)) },
@@ -386,13 +398,29 @@ private fun ProviderKeyDialog(
                     },
                     modifier = Modifier.fillMaxWidth(),
                 )
+                if (provider.needsRegion) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = regionDraft,
+                        onValueChange = { regionDraft = it },
+                        singleLine = true,
+                        label = { Text(stringResource(R.string.engines_cloud_region_label)) },
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.engines_cloud_region_hint),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
             }
         },
         confirmButton = {
             TextButton(
-                enabled = draft.isNotBlank(),
+                enabled = draft.isNotBlank() && regionOk,
                 onClick = {
-                    onSave(draft)
+                    onSave(draft, regionDraft)
                     onDismiss()
                 },
             ) { Text(stringResource(R.string.engines_cloud_save)) }
@@ -402,7 +430,7 @@ private fun ProviderKeyDialog(
                 if (keySet) {
                     TextButton(
                         onClick = {
-                            onSave("")
+                            onSave("", regionDraft)
                             onDismiss()
                         },
                     ) { Text(stringResource(R.string.engines_cloud_remove_key)) }

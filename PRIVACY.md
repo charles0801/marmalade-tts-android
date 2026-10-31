@@ -43,10 +43,12 @@ described in full below.
 ## Cloud voice providers (optional)
 
 Marmalade can synthesize speech through third-party cloud providers —
-currently **Venice AI** and **OpenAI**, with the list updatable in future
-releases. This is entirely opt-in. It does nothing until you go to
-**Engines → Cloud voices**, add your own API key for a provider, and
-select one of that provider's voices.
+currently **Venice AI**, **OpenAI** and **Microsoft Azure AI Speech**, with
+the list updatable in future releases. This is entirely opt-in. It does
+nothing until you go to **Engines → Cloud voices**, add your own API key
+for a provider, and select one of that provider's voices. For Azure you
+also choose the Azure region your key belongs to, which selects the
+endpoint.
 
 The first time you open that screen, the app shows a disclaimer covering
 everything in this section and will not let you configure a provider
@@ -70,6 +72,8 @@ before enabling a cloud voice:
 
 - Venice AI — <https://venice.ai/legal/privacy> and <https://venice.ai/legal/tos>
 - OpenAI — <https://openai.com/policies/privacy-policy> and <https://openai.com/policies/terms-of-use>
+- Microsoft Azure AI Speech — <https://privacy.microsoft.com/privacystatement> and
+  <https://www.microsoft.com/licensing/terms/product/ForOnlineServices/all>
 
 **We are not affiliated with, endorsed by, sponsored by, or partnered
 with any of these providers in any way.** Marmalade is an independent

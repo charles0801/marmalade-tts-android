@@ -5,6 +5,21 @@ This project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Azure AI Speech as a cloud provider.** Under **Engines → Cloud voices**
+  you can now add a Microsoft Azure Speech key together with the Azure
+  region it belongs to; Marmalade then offers that region's Azure voices,
+  updated from the service's own voice list. Voices are labelled with their
+  Azure names and languages, and speed follows the app's speed setting,
+  within Azure's own 0.5×–2× limit. The voices appear in the pickers like
+  any other cloud voice. Nothing changes unless you configure a key.
+- **A region can be changed without re-entering the key's endpoint**: the
+  key dialog remembers the region the current key was saved for.
+
+### Changed
+- The cloud voices card is now called **"Cloud voices"** rather than naming
+  one wire format, because the same engine also speaks Azure's format.
+
 ## [1.3.3] - 2026-10-23
 
 ### Added

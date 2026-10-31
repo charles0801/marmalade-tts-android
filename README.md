@@ -39,7 +39,7 @@ human, private by default.
 - **Natural neural voices.** Ready to speak the moment you install
 - **Fast.** Speech responds quickly even on modest phones
 - **Private by default.** Everything runs on your device
-- **Optional cloud voices.** From private third parties with your own API key (Venice.ai)
+- **Optional cloud voices.** From private third parties with your own API key (Venice.ai, OpenAI and Azure)
 - **Per app voices.** Route each app to its own voice
 - **Speaks 8 languages.** Auto detects what language is being read on the Kokoro TTS engine
 - **Accessible.** TalkBack supported and designed to meet WCAG 2.1 AA
@@ -82,8 +82,8 @@ A fast English voice (Kitten Nano) is built into the APK, so Marmalade
 speaks offline from the first launch. Bigger and better engines download
 on demand from hostnames pinned in the catalog into app-private storage;
 add or remove them anytime from the **Engines** tab. Cloud voices are
-strictly opt-in: add your own API key for a provider (Venice.ai and
-OpenAI ship in the list) and mind that only the provider you configure
+strictly opt-in: add your own API key for a provider (Venice.ai, OpenAI and
+Azure ship in the list) and mind that only the provider you configure
 ever sees your text. Details in [PRIVACY.md](PRIVACY.md).
 
 ## License

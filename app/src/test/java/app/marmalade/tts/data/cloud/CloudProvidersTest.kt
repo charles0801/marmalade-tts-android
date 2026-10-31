@@ -115,10 +115,14 @@ class CloudProvidersTest {
         assertTrue("openai" in ids)
         for (p in providers) {
             assertTrue("provider ${p.id} has no models", p.models.isNotEmpty())
-            assertTrue(
-                "provider ${p.id} has no voices",
-                p.models.all { it.voices.isNotEmpty() },
-            )
+            // A discovering provider may start with empty static voices (Azure
+            // discovers its whole list); a static provider must list them.
+            if (!p.discoverVoices) {
+                assertTrue(
+                    "provider ${p.id} has no voices",
+                    p.models.all { it.voices.isNotEmpty() },
+                )
+            }
             assertFalse(p.baseUrl.endsWith("/"))
             assertTrue(
                 "provider ${p.id} must be https",
@@ -151,6 +155,17 @@ class CloudProvidersTest {
         for (bad in listOf("tts-orpheus", "tts-chatterbox-hd", "tts-qwen3-0-6b")) {
             assertFalse("$bad is not verified usable and must stay out", bad in rates)
         }
+
+        // Azure is the second wire style: regional endpoint template, no
+        // static voices (its list is discovered), and one allowlisted model.
+        val azure = providers.first { it.id == "azure" }
+        assertEquals(CloudApiStyle.AZURE, azure.api)
+        assertTrue(azure.needsRegion)
+        assertTrue(azure.discoverVoices)
+        assertEquals("https://{region}.tts.speech.microsoft.com", azure.baseUrl)
+        assertTrue(azure.models.single().voices.isEmpty())
+        // Fixed by the request's output-format header, whatever the voice.
+        assertEquals(24_000, azure.models.single().sampleRate)
     }
 
     @Test
@@ -255,6 +270,131 @@ class CloudProvidersTest {
         assertEquals(LatencyBucket.QUICK, seed("tts-xai-v1"))
         assertEquals(LatencyBucket.SLOW, seed("tts-inworld-1-5-max"))
         assertEquals(LatencyBucket.SLOW, seed("tts-gemini-3-1-flash"))
+    }
+
+    // --- wire styles: OpenAI-shaped vs Azure AI Speech ---
+
+    @Test
+    fun `parses the azure style with its region template`() {
+        val doc = CloudProviders.parseDocument(
+            """
+            {"version": 3, "providers": [{
+              "id": "azure", "displayName": "Azure Speech", "api": "azure",
+              "baseUrl": "https://{region}.tts.speech.microsoft.com",
+              "needsRegion": true, "discoverVoices": true,
+              "models": [{"id": "neural", "voices": []}]
+            }]}
+            """.trimIndent(),
+        )
+        val azure = doc.providers.single()
+        assertEquals(CloudApiStyle.AZURE, azure.api)
+        assertTrue(azure.needsRegion)
+        assertTrue(azure.discoverVoices)
+        assertEquals("https://{region}.tts.speech.microsoft.com", azure.baseUrl)
+        // No region saved yet, so there is no request URL to use.
+        assertNull(azure.endpoint())
+    }
+
+    @Test
+    fun `an absent api field means the openai shape`() {
+        val provider = CloudProviders.parse(
+            """{"providers": [{"id": "v", "displayName": "V", "baseUrl": "https://x.example"}]}""",
+        ).single()
+        assertEquals(CloudApiStyle.OPENAI, provider.api)
+        assertFalse(provider.needsRegion)
+        assertEquals(provider.baseUrl, provider.endpoint())
+    }
+
+    @Test
+    fun `an unknown api rejects the whole document`() {
+        // A build that can't speak a protocol must not half-apply the list;
+        // the caller then keeps the bundled descriptors.
+        assertThrows(JSONException::class.java) {
+            CloudProviders.parse(
+                """{"providers": [{"id": "x", "displayName": "X",
+                     "baseUrl": "https://x.example", "api": "vendor"}]}""",
+            )
+        }
+    }
+
+    @Test
+    fun `a regional provider without its region token is rejected`() {
+        assertThrows(JSONException::class.java) {
+            CloudProviders.parse(
+                """{"providers": [{"id": "x", "displayName": "X",
+                     "baseUrl": "https://tts.x.example", "needsRegion": true}]}""",
+            )
+        }
+    }
+
+    @Test
+    fun `region templates compare by site`() {
+        val template = "https://{region}.tts.speech.microsoft.com"
+        assertTrue(CloudProviders.sameSite(template, "https://eastus.tts.speech.microsoft.com"))
+        // A move to the sovereign-cloud domain is a different site.
+        assertFalse(CloudProviders.sameSite(template, "https://eastus.tts.speech.azure.us"))
+        assertFalse(CloudProviders.sameSite(template, "https://{region}.evil.example"))
+    }
+
+    @Test
+    fun `azure voice list parses names languages and genders`() {
+        val model = CloudModel("neural", "Neural voices", emptyList(), sampleRate = 24_000)
+        val parsed = CloudProviders.parseAzureVoices(AZURE_VOICES, model).single()
+
+        assertEquals(
+            listOf(
+                "en-US-JennyNeural",
+                "en-US-Ava:DragonHDLatestNeural",
+                "zh-CN-liaoning-XiaobeiNeural",
+            ),
+            parsed.voices,
+        )
+        val jenny = parsed.voiceInfo.getValue("en-US-JennyNeural")
+        assertEquals("Jenny", jenny.displayName)
+        assertEquals("en-US", jenny.languageCode)
+        assertEquals("female", jenny.gender)
+        // Dialect voices keep the locale, which is the first two labels.
+        assertEquals("zh-CN", parsed.voiceInfo.getValue("zh-CN-liaoning-XiaobeiNeural").languageCode)
+        // Deprecated voices never reach the picker.
+        assertFalse("en-US-OldNeural" in parsed.voices)
+        // Capabilities still come from the descriptor.
+        assertEquals(24_000, parsed.sampleRate)
+    }
+
+    @Test
+    fun `parseDiscovery picks the parser from the provider's api style`() {
+        val azure = CloudProvider(
+            id = "azure", displayName = "Azure", keyHint = "",
+            baseUrl = "https://{region}.tts.speech.microsoft.com",
+            discoverVoices = true, needsRegion = true, api = CloudApiStyle.AZURE,
+            models = listOf(CloudModel("neural", "Neural voices", emptyList())),
+        )
+        val voices = CloudProviders.parseDiscovery(azure, AZURE_VOICES)
+        assertEquals(listOf("neural"), voices.map { it.id })
+        assertEquals(3, voices.single().voices.size)
+
+        val openAi = azure.copy(
+            id = "openai", baseUrl = "https://api.openai.com/v1",
+            needsRegion = false, api = CloudApiStyle.OPENAI,
+        )
+        assertTrue(CloudProviders.parseDiscovery(openAi, "{}").isEmpty())
+    }
+
+    @Test
+    fun `merge carries discovered voice metadata and keeps the descriptor rate`() {
+        val allowed = listOf(CloudModel("neural", "Neural voices", emptyList(), sampleRate = 24_000))
+        val discovered = listOf(
+            CloudModel(
+                "neural", "Neural voices", listOf("en-US-JennyNeural"),
+                voiceInfo = mapOf(
+                    "en-US-JennyNeural" to CloudVoiceInfo("Jenny", "en-US", "female"),
+                ),
+            ),
+        )
+        val merged = CloudProviders.mergeDiscovered(allowed, discovered).single()
+        assertEquals(listOf("en-US-JennyNeural"), merged.voices)
+        assertEquals("Jenny", merged.voiceInfo.getValue("en-US-JennyNeural").displayName)
+        assertEquals(24_000, merged.sampleRate)
     }
 
     // --- L2: the remote list may only move a built-in provider within its site ---
@@ -419,3 +559,17 @@ class CloudProvidersTest {
             ?.use { it.readBytes().toString(Charsets.UTF_8) }
             ?: java.io.File("src/main/assets/cloud-providers.json").readText()
 }
+
+/** A trimmed Azure `/cognitiveservices/voices/list` response. */
+private val AZURE_VOICES = """
+    [
+      {"ShortName": "en-US-JennyNeural", "DisplayName": "Jenny",
+       "Locale": "en-US", "Gender": "Female", "Status": "GA"},
+      {"ShortName": "en-US-Ava:DragonHDLatestNeural", "DisplayName": "Ava",
+       "Locale": "en-US", "Gender": "Female", "Status": "GA"},
+      {"ShortName": "zh-CN-liaoning-XiaobeiNeural", "DisplayName": "Xiaobei",
+       "Locale": "zh-CN", "Gender": "Female", "Status": "GA"},
+      {"ShortName": "en-US-OldNeural", "DisplayName": "Old",
+       "Locale": "en-US", "Gender": "Male", "Status": "Deprecated"}
+    ]
+""".trimIndent()

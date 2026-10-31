@@ -1,5 +1,5 @@
 {
-  "version": 2,
+  "version": 3,
   "providers": [
     {
       "id": "venice",
@@ -254,6 +254,23 @@
             "shimmer"
           ],
           "sampleRate": 24000
+        }
+      ]
+    },
+    {
+      "id": "azure",
+      "displayName": "Azure Speech",
+      "api": "azure",
+      "baseUrl": "https://{region}.tts.speech.microsoft.com",
+      "keyHint": "portal.azure.com → Speech service → Keys and Endpoint",
+      "needsRegion": true,
+      "discoverVoices": true,
+      "models": [
+        {
+          "id": "neural",
+          "displayName": "Neural voices",
+          "sampleRate": 24000,
+          "voices": []
         }
       ]
     }

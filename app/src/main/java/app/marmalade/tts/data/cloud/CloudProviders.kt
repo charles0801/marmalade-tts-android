@@ -46,24 +46,35 @@ import org.json.JSONObject
 // -----------------------------------------------------------------------------
 
 /**
- * One OpenAI-compatible hosted TTS provider, described as *data* — adding
- * or updating a provider is a JSON edit (remotely fetchable), never an
- * app release. All descriptors share the same wire protocol
- * (`POST {baseUrl}/audio/speech`, Bearer-key auth, `response_format:
- * "wav"`); what varies per provider is only this metadata.
+ * One hosted TTS provider, described as *data* — adding or updating a
+ * provider is a JSON edit (remotely fetchable), never an app release.
+ * [api] picks the wire protocol; what varies per provider is otherwise
+ * only this metadata.
  *
  * @property id            Stable key — appears inside cloud voice ids and
  *                         per-provider DataStore key names. Never rename.
  * @property displayName   User-facing provider name.
  * @property baseUrl       API root, no trailing slash (e.g.
- *                         `https://api.venice.ai/api/v1`).
+ *                         `https://api.venice.ai/api/v1`). For a regional
+ *                         provider ([needsRegion]) this is a template with
+ *                         [AzureSpeech.REGION_TOKEN].
  * @property keyHint       Where the user gets an API key, shown in the
  *                         configure dialog.
- * @property discoverVoices True when the provider serves a public
- *                         `GET {baseUrl}/models?type=tts` whose entries
- *                         carry `model_spec.voices` (Venice does). Discovery
- *                         refreshes the voice arrays of [models]; it cannot
- *                         introduce a model that isn't already listed.
+ * @property api           The wire protocol. Absent in JSON means
+ *                         [CloudApiStyle.OPENAI].
+ * @property needsRegion   True when the provider's endpoint is regional and
+ *                         the user must supply a region with the key. The
+ *                         active endpoint is then [resolvedBaseUrl].
+ * @property discoverVoices True when the provider serves a live voice list.
+ *                         For [CloudApiStyle.OPENAI] that is
+ *                         `GET {baseUrl}/models?type=tts` whose entries carry
+ *                         `model_spec.voices` (Venice does); for
+ *                         [CloudApiStyle.AZURE] it is
+ *                         `GET {endpoint}/cognitiveservices/voices/list`. In
+ *                         both, discovery refreshes the voice arrays of
+ *                         [models]; it cannot introduce a model that isn't
+ *                         already listed. An Azure model may ship an empty
+ *                         static list because discovery is its only source.
  * @property models        The allowlist: every model this app will speak
  *                         through, with its verified capabilities.
  * @property movedOffSite  Not part of the JSON. True when the downloaded
@@ -73,6 +84,11 @@ import org.json.JSONObject
  *                         saved a key for ([CloudProviders.pinKeyedSites]);
  *                         [baseUrl] is then still the pinned one, and the UI
  *                         tells a user with a saved key to update the app.
+ * @property resolvedBaseUrl Not part of the JSON. For a [needsRegion]
+ *                         provider, the endpoint its saved region resolves
+ *                         to ([CloudProviderStore] fills it from the URL
+ *                         recorded with the key). Null until a key with a
+ *                         region is saved.
  */
 data class CloudProvider(
     val id: String,
@@ -81,8 +97,22 @@ data class CloudProvider(
     val keyHint: String,
     val discoverVoices: Boolean,
     val models: List<CloudModel>,
+    val api: CloudApiStyle = CloudApiStyle.OPENAI,
+    val needsRegion: Boolean = false,
     val movedOffSite: Boolean = false,
-)
+    val resolvedBaseUrl: String? = null,
+) {
+    /**
+     * The URL requests go to, or null when this provider needs a region and
+     * the user hasn't supplied one yet. A non-regional provider always has
+     * one ([baseUrl]).
+     */
+    fun endpoint(): String? = if (needsRegion) resolvedBaseUrl else baseUrl
+
+    /** The endpoint this provider would have in [region]. */
+    fun endpointForRegion(region: String): String =
+        if (needsRegion) AzureSpeech.endpointFor(baseUrl, region) else baseUrl
+}
 
 /**
  * One TTS model a provider serves, with its voice list and the capabilities
@@ -107,6 +137,11 @@ data class CloudProvider(
  *   a few times (see [app.marmalade.tts.data.VoiceLatencyTracker]). It lives
  *   here rather than in Kotlin precisely so a provider that gets faster can
  *   be corrected by publishing a descriptor, without an app release.
+ *
+ * @property voiceInfo Per-voice metadata keyed by voice id, filled by live
+ *   discovery for providers whose voice list carries it (Azure). Empty for
+ *   providers whose voices are bare ids (OpenAI, Venice), whose rows keep
+ *   the id-derived heuristics in [app.marmalade.tts.data.CloudApiVoiceCatalog].
  */
 data class CloudModel(
     val id: String,
@@ -114,12 +149,32 @@ data class CloudModel(
     val voices: List<String>,
     val sampleRate: Int = DEFAULT_SAMPLE_RATE,
     val latency: LatencyBucket? = null,
+    val voiceInfo: Map<String, CloudVoiceInfo> = emptyMap(),
 ) {
     companion object {
         /** Kokoro's rate; the historical assumption for every cloud model. */
         const val DEFAULT_SAMPLE_RATE = 24_000
     }
 }
+
+/**
+ * What a provider discloses about one voice beyond its id: how to label it
+ * and which language it speaks. Azure's voice list has all three; the
+ * OpenAI-shaped lists have none, so their rows derive what they can from the
+ * id.
+ *
+ * @property displayName The voice's own name ("Jenny"), not its ShortName.
+ * @property languageCode BCP-47 tag ("en-US"); the engine's placeholder
+ *   "en-US" for a multilingual voice would make language routing believe it
+ *   is English only, so a provider that knows the language says so here.
+ * @property gender `"female"` / `"male"`, or null when unspecified — the
+ *   picker's stored convention (`VoiceMeta.gender`).
+ */
+data class CloudVoiceInfo(
+    val displayName: String,
+    val languageCode: String,
+    val gender: String? = null,
+)
 
 /**
  * A parsed `cloud-providers.json`, including its schema [version].
@@ -151,13 +206,30 @@ object CloudProviders {
             version = root.optInt("version", 0),
             providers = (0 until providers.length()).map { i ->
                 val p = providers.getJSONObject(i)
+                val baseUrl = requireHttps(p.getString("baseUrl").trimEnd('/'))
+                val api = CloudApiStyle.parse(p.optString("api"))
+                    ?: throw JSONException(
+                        "Unknown cloud provider api '${p.optString("api")}' for ${p.getString("id")}",
+                    )
+                val needsRegion = p.optBoolean(
+                    "needsRegion",
+                    api == CloudApiStyle.AZURE && AzureSpeech.REGION_TOKEN in baseUrl,
+                ) || AzureSpeech.REGION_TOKEN in baseUrl
+                if (needsRegion && AzureSpeech.REGION_TOKEN !in baseUrl) {
+                    throw JSONException(
+                        "Regional provider ${p.getString("id")} has no " +
+                            "${AzureSpeech.REGION_TOKEN} in its baseUrl",
+                    )
+                }
                 CloudProvider(
                     id = p.getString("id"),
                     displayName = p.getString("displayName"),
-                    baseUrl = requireHttps(p.getString("baseUrl").trimEnd('/')),
+                    baseUrl = baseUrl,
                     keyHint = p.optString("keyHint"),
                     discoverVoices = p.optBoolean("discoverVoices", false),
                     models = parseModels(p.optJSONArray("models")),
+                    api = api,
+                    needsRegion = needsRegion,
                 )
             },
         )
@@ -262,10 +334,15 @@ object CloudProviders {
      * [registrableDomain]. Unparseable URLs fail.
      */
     fun sameSite(trusted: String, candidate: String): Boolean {
-        val candidateUri = runCatching { URI(candidate) }.getOrNull() ?: return false
+        // A regional template isn't a parseable URI until its placeholder is
+        // a valid label. Substituting a fixed one keeps the site comparison
+        // meaningful — the user's region varies, the site does not.
+        val trustedUrl = trusted.replace(AzureSpeech.REGION_TOKEN, "region")
+        val candidateUrl = candidate.replace(AzureSpeech.REGION_TOKEN, "region")
+        val candidateUri = runCatching { URI(candidateUrl) }.getOrNull() ?: return false
         if (!candidateUri.scheme.equals("https", ignoreCase = true)) return false
-        val candidateHost = hostOf(candidate) ?: return false
-        val trustedHost = hostOf(trusted) ?: return false
+        val candidateHost = hostOf(candidateUrl) ?: return false
+        val trustedHost = hostOf(trustedUrl) ?: return false
         if (candidateHost == trustedHost) return true
         return registrableDomain(candidateHost) == registrableDomain(trustedHost)
     }
@@ -348,15 +425,62 @@ object CloudProviders {
     }
 
     /**
+     * Parse a provider's live voice list in whatever shape its [CloudApiStyle]
+     * serves. [CloudProviderStore] caches the raw body and re-runs this on
+     * every load, so it must be a pure parse.
+     */
+    fun parseDiscovery(provider: CloudProvider, json: String): List<CloudModel> =
+        when (provider.api) {
+            CloudApiStyle.OPENAI -> parseDiscoveredModels(json)
+            CloudApiStyle.AZURE -> parseAzureVoices(json, provider.models.firstOrNull())
+        }
+
+    /**
+     * Parse Azure's `GET /cognitiveservices/voices/list` response: a top-level
+     * array of voices, each with `ShortName`, `DisplayName`, `Locale`,
+     * `Gender` and `Status`. The service has no model dimension, so every
+     * voice belongs to [model] (the descriptor's single allowlisted model)
+     * and its rate stays the descriptor's — the output format header, not the
+     * voice, decides the sample rate.
+     *
+     * Deprecated voices are skipped; the list is otherwise taken as served.
+     * That is safe for Azure in a way it is not for an OpenAI-shaped provider:
+     * every Azure voice speaks the same SSML protocol, so a newly added one
+     * can't break the wire contract.
+     */
+    fun parseAzureVoices(json: String, model: CloudModel?): List<CloudModel> {
+        model ?: return emptyList()
+        val root = JSONArray(json)
+        val voices = mutableListOf<String>()
+        val info = mutableMapOf<String, CloudVoiceInfo>()
+        for (i in 0 until root.length()) {
+            val v = root.optJSONObject(i) ?: continue
+            val id = v.optString("ShortName").trim()
+            if (id.isEmpty() || v.optString("Status").equals("Deprecated", ignoreCase = true)) continue
+            if (id in info) continue
+            voices += id
+            info[id] = CloudVoiceInfo(
+                displayName = v.optString("DisplayName").ifBlank { id },
+                languageCode = v.optString("Locale").takeIf { it.isNotBlank() }
+                    ?: AzureSpeech.localeOf(id) ?: "en-US",
+                gender = v.optString("Gender").lowercase()
+                    .takeIf { it == "female" || it == "male" },
+            )
+        }
+        if (voices.isEmpty()) return emptyList()
+        return listOf(model.copy(voices = voices, voiceInfo = info))
+    }
+
+    /**
      * Join a live-discovery result onto the descriptor's allowlist.
      *
      * Voices come from [discovered] (the provider is authoritative about
      * which voices exist); everything else — crucially [CloudModel.sampleRate]
-     * — comes from [allowed], because the provider's `/models` response
-     * carries no capability data. A discovered model with no descriptor
-     * entry is dropped; an allowed model absent from discovery keeps its
-     * static voice list so an unreachable network degrades to the bundled
-     * catalog rather than an empty picker.
+     * — comes from [allowed], because the provider's list response carries
+     * no capability data. A discovered model with no descriptor entry is
+     * dropped; an allowed model absent from discovery keeps its static voice
+     * list so an unreachable network degrades to the bundled catalog rather
+     * than an empty picker.
      */
     fun mergeDiscovered(
         allowed: List<CloudModel>,
@@ -368,6 +492,7 @@ object CloudProviders {
             model.copy(
                 displayName = live.displayName.ifBlank { model.displayName },
                 voices = live.voices,
+                voiceInfo = live.voiceInfo,
             )
         }
     }
