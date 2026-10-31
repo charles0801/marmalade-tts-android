@@ -109,6 +109,29 @@ class SettingsRepositoryTest {
         )
     }
 
+    // -- advertised default voices (system TTS echo detection) --------------
+
+    @Test
+    fun advertisedDefaultVoiceIds_startEmpty() = runTest {
+        assertEquals(emptySet<String>(), newRepo().advertisedDefaultVoiceIds.first())
+    }
+
+    @Test
+    fun recordAdvertisedDefaultVoice_dedupesAndPersists() = runTest {
+        val repo = newRepo()
+        repo.recordAdvertisedDefaultVoice("kokoro-direct-v1_0:af_bella")
+        repo.recordAdvertisedDefaultVoice("kokoro-direct-v1_0:af_bella")
+        repo.recordAdvertisedDefaultVoice("kitten-direct-v0_8:Bella")
+
+        assertEquals(
+            setOf(
+                "kokoro-direct-v1_0:af_bella",
+                "kitten-direct-v0_8:Bella",
+            ),
+            repo.advertisedDefaultVoiceIds.first(),
+        )
+    }
+
     // -- reader display settings ---------------------------------------------
 
     @Test

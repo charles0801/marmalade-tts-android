@@ -20,6 +20,16 @@ This project follows [Semantic Versioning](https://semver.org/).
 - The cloud voices card is now called **"Cloud voices"** rather than naming
   one wire format, because the same engine also speaks Azure's format.
 
+### Fixed
+- **Changing the primary alias's voice now reaches apps that use Marmalade
+  as the system voice.** Some TTS clients cache the default voice the engine
+  advertises and keep sending it after the user changes that alias's voice;
+  the cached value looked like a deliberate choice and outranked the primary
+  alias, so system TTS kept speaking the first voice selected. The engine now
+  remembers the defaults it has advertised and treats a cached one as an
+  echo of the default, so the alias's current voice wins. It needs no app
+  reload and survives restarts.
+
 ## [1.3.3] - 2026-10-23
 
 ### Added

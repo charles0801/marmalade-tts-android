@@ -8,6 +8,7 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.intPreferencesKey
 import androidx.datastore.preferences.core.longPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.core.stringSetPreferencesKey
 import app.marmalade.tts.BuildConfig
 import app.marmalade.tts.install.EngineCatalog
 import app.marmalade.tts.perf.KittenRtfMeasurement
@@ -18,6 +19,7 @@ import app.marmalade.tts.ui.theme.ThemePreset
 import javax.inject.Inject
 import javax.inject.Singleton
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
 
 // -----------------------------------------------------------------------------
@@ -169,6 +171,42 @@ open class SettingsRepository internal constructor(
             } else {
                 prefs[KEY_PRIMARY_ALIAS_ID] = value
             }
+        }
+    }
+
+    /**
+     * Voice ids this engine has presented to system TTS clients as the
+     * **English default** — every answer
+     * [app.marmalade.tts.service.MarmaladeTtsService.onGetDefaultVoiceNameFor]
+     * has given, plus every voice the primary alias has spoken with.
+     *
+     * Clients auto-fill `SynthesisRequest.voiceName` from that answer and
+     * may cache it for the life of their own process. Once the user changes
+     * the primary alias's voice, an old value keeps arriving looking exactly
+     * like a deliberate caller pick — the "system TTS keeps speaking the
+     * first voice I chose" bug. The synthesis path treats a member of this
+     * set as an echo of our default rather than a pick, so the current
+     * primary alias wins.
+     *
+     * Non-English defaults are deliberately **not** recorded: they name a
+     * voice of the requested language, and those requests must keep beating
+     * the (English-shaped) primary alias.
+     */
+    open val advertisedDefaultVoiceIds: Flow<Set<String>> = dataStore.data.map { prefs ->
+        prefs[KEY_ADVERTISED_DEFAULT_VOICE_IDS] ?: emptySet()
+    }
+
+    /**
+     * Record [voiceId] as a default this engine has advertised. A no-op
+     * when it is already known, so the negotiation callback (which can fire
+     * per `setLanguage`) does not write to disk every time.
+     */
+    open suspend fun recordAdvertisedDefaultVoice(voiceId: String) {
+        if (voiceId.isBlank()) return
+        if (voiceId in advertisedDefaultVoiceIds.first()) return
+        dataStore.edit { prefs ->
+            prefs[KEY_ADVERTISED_DEFAULT_VOICE_IDS] =
+                (prefs[KEY_ADVERTISED_DEFAULT_VOICE_IDS] ?: emptySet()) + voiceId
         }
     }
 
@@ -766,6 +804,15 @@ open class SettingsRepository internal constructor(
         // reads it, and a pointer at a wiped alias is already handled as
         // "no primary" by every caller.
         private val KEY_PRIMARY_ALIAS_ID = stringPreferencesKey("primary_alias_id")
+
+        /**
+         * English defaults advertised to system TTS clients, so a request
+         * still stamped with a previous primary alias's voice is recognized
+         * as an auto-fill echo rather than a deliberate pick — see
+         * [advertisedDefaultVoiceIds].
+         */
+        private val KEY_ADVERTISED_DEFAULT_VOICE_IDS =
+            stringSetPreferencesKey("advertised_default_voice_ids")
 
         // Last-seeded catalog version. v0.1.19 introduces this so that
         // expanding a voice catalog (e.g. Kokoro 11 → 53 voices for

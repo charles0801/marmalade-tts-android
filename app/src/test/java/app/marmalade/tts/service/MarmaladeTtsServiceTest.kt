@@ -31,6 +31,7 @@ import java.util.Locale
 import kotlin.math.sin
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.flowOf
 import app.marmalade.tts.engine.EngineRegistry
 import org.junit.Assert.assertEquals
@@ -521,6 +522,68 @@ class MarmaladeTtsServiceTest {
         val (_, voiceId, speed) = fakeKokoroDirectEngine.calls.single()
         assertEquals("kokoro-direct-v1_0:bm_lewis", voiceId)
         assertEquals(1.0f, speed)
+    }
+
+    @Test
+    fun onSynthesizeText_staleAdvertisedDefault_yieldsToChangedPrimaryAlias() {
+        // The primary alias starts on af_bella, and the engine advertises it
+        // to clients as the English default.
+        installKokoroPrimary(voiceId = "kokoro-direct-v1_0:af_bella")
+        assertEquals(
+            "kokoro-direct-v1_0:af_bella",
+            service.onGetDefaultVoiceNameFor("en", "US", ""),
+        )
+
+        // The user changes the primary alias's voice. A client that cached
+        // the advertised default keeps stamping af_bella; because it is a
+        // recorded echo, the alias's new voice must win.
+        installKokoroPrimary(voiceId = "kokoro-direct-v1_0:af_heart")
+        fakeKokoroDirectEngine.nextPcm = ShortArray(1024) { 0 }
+
+        service.onSynthesizeText(
+            newRequestWithVoice("hello", "kokoro-direct-v1_0:af_bella"),
+            FakeSynthesisCallback(),
+        )
+
+        assertEquals(0, fakeEngine.calls.size)
+        assertEquals("kokoro-direct-v1_0:af_heart", fakeKokoroDirectEngine.calls.single().second)
+    }
+
+    @Test
+    fun onSynthesizeText_aVoiceUsedByThePrimary_isRememberedAsAnEcho() {
+        // No onGetDefaultVoiceNameFor call here: the voice becomes known as
+        // a default simply by the primary alias speaking with it, so an
+        // upgrade from a build that recorded nothing still heals once the
+        // alias has been used.
+        installKokoroPrimary(voiceId = "kokoro-direct-v1_0:af_bella")
+        fakeKokoroDirectEngine.nextPcm = ShortArray(1024) { 0 }
+        service.onSynthesizeText(SynthesisRequest("hello", Bundle()), FakeSynthesisCallback())
+
+        installKokoroPrimary(voiceId = "kokoro-direct-v1_0:af_heart")
+        service.onSynthesizeText(
+            newRequestWithVoice("hello", "kokoro-direct-v1_0:af_bella"),
+            FakeSynthesisCallback(),
+        )
+
+        assertEquals(
+            listOf("kokoro-direct-v1_0:af_bella", "kokoro-direct-v1_0:af_heart"),
+            fakeKokoroDirectEngine.calls.map { it.second },
+        )
+    }
+
+    @Test
+    fun onGetDefaultVoiceNameFor_nonEnglishDefaultIsNotAnEcho() {
+        installKokoroPrimary(voiceId = "kokoro-direct-v1_0:af_bella")
+
+        // A non-English default names a voice of the requested language. It
+        // is not recorded as an echo, so a language request keeps winning
+        // over the English-shaped primary alias.
+        val spanish = service.onGetDefaultVoiceNameFor("es", "ES", "")
+        assertTrue(spanish.isNotEmpty())
+        assertEquals(
+            emptySet<String>(),
+            kotlinx.coroutines.runBlocking { fakeSettings.advertisedDefaultVoiceIds.first() },
+        )
     }
 
     @Test
@@ -1802,6 +1865,16 @@ internal class FakePreprocessSettings(
     private val primary = MutableStateFlow<String?>(null)
     override val primaryAliasId: Flow<String?> = primary
     override suspend fun setPrimaryAliasId(value: String?) { primary.value = value }
+
+    // The service records every English default it advertises and consults
+    // that set when classifying a requested voice (see the stale-default
+    // regression test). The parent's flow is on the no-op DataStore, whose
+    // empty flow would make first() suspend forever.
+    private val advertisedDefaults = MutableStateFlow<Set<String>>(emptySet())
+    override val advertisedDefaultVoiceIds: Flow<Set<String>> = advertisedDefaults
+    override suspend fun recordAdvertisedDefaultVoice(voiceId: String) {
+        advertisedDefaults.value = advertisedDefaults.value + voiceId
+    }
 }
 
 private val NoOpPreferencesDataStoreForService =

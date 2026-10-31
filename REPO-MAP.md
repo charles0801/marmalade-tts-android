@@ -960,14 +960,38 @@ and `MarmaladeSynthService` is its foreground host. System TTS
   the same harness.
 
 ### Cloud API engine (hosted voices)
-- `engine/api/CloudApiEngine.kt` — OpenAI-compatible `/audio/speech`
-  synthesis with true streaming (WAV header parse + chunked PCM emit).
-  Text over `maxInputChars` (1000) is sent as several requests:
-  sentence-packed chunks, `splitToFit` for a single oversize sentence.
-  One engine for all providers; the voice id carries provider + model:
-  `cloud-api-v1:<provider>:<model>:<voice>`.
-- `data/cloud/CloudProviders.kt` — provider descriptors as data
-  (parse of `cloud-providers.json` + of live `/models?type=tts`).
+- `engine/api/CloudApiEngine.kt` — hosted synthesis over one of two wire
+  styles (`data/cloud/CloudApiStyle.kt`): OpenAI-compatible
+  `/audio/speech` (JSON body, `Authorization: Bearer`, WAV or MP3
+  response) and Azure AI Speech (`POST {endpoint}/cognitiveservices/v1`,
+  SSML body, `Ocp-Apim-Subscription-Key`,
+  `riff-24khz-16bit-mono-pcm`). True streaming (WAV header parse +
+  chunked PCM emit) on both. Azure takes speed as an SSML `<prosody
+  rate>` multiplier, capped at its documented 0.5–2× range; the chunk text
+  is XML-escaped, and a DragonHD voice name's `:` is kept out of the voice
+  id (see below). Text over `maxInputChars` (1000) is sent as
+  several requests: sentence-packed chunks, `splitToFit` for a single
+  oversize sentence. One engine for all providers; the voice id carries
+  provider + model: `cloud-api-v1:<provider>:<model>:<voice>`. The voice
+  segment is percent-escaped for `:`/`%` because Azure HD voices are named
+  `en-US-Ava:DragonHDLatestNeural`; `parseVoiceId` decodes it.
+- `data/cloud/CloudProviders.kt` — provider descriptors as data (parse of
+  `cloud-providers.json` + of live discovery). A descriptor may set
+  `"api": "azure"` and a regional `baseUrl` template
+  `https://{region}.tts.speech.microsoft.com` with `"needsRegion": true`;
+  the user's region (entered with the key) is stored in the same
+  `cloud_api_key_base_url_<id>` pref as the saved URL, and
+  `CloudProvider.endpoint()` is null until then. `sameSite` substitutes
+  the region token before comparing, so the site pin still works.
+  Azure discovery parses `/cognitiveservices/voices/list` into the
+  descriptor's single model, filling `CloudModel.voiceInfo` (display name,
+  locale, gender) — unlike the OpenAI shape, its static voice list may be
+  empty because discovery is its only source. See
+  `CloudProviders.parseDiscovery`. **Do not add Azure to the remote
+  engines-repo copy yet**: a build that predates `CloudApiStyle` parses the
+  entry (it ignores `"api"`) and offers a provider whose `{region}`
+  template it cannot turn into a request URL, so users would configure a
+  key that can never work. Bundled-only until old builds age out.
 - `data/cloud/CloudProviderStore.kt` — merges bundled asset, remotely
   fetched descriptor overrides (engines repo), and per-provider live
   voice discovery; owns the engine's `voice_meta` rows via
@@ -990,7 +1014,10 @@ and `MarmaladeSynthService` is its foreground host. System TTS
 - "Installed" = any provider key in `SettingsRepository.cloudApiKeys`
   (`cloud_api_key_<provider>` prefs; legacy `cloud_api_key` reads as
   Venice). Configure UI: Engines tab → Cloud voices card →
-  `ui/screen/CloudApiScreen.kt`.
+  `ui/screen/CloudApiScreen.kt`. A regional provider (Azure) also asks for
+  its region in the key dialog; `CloudApiViewModel.setKey` validates it
+  (`AzureSpeech.isValidRegion`), stores it with the key, and invalidates
+  the store's provider cache before resyncing.
 
 ### Install / download
 - `install/EngineCatalog.kt` — descriptors for installable engines
@@ -1281,6 +1308,19 @@ its pre-#96 path**: each check is `sentencePauseMs > 0`, pinned by
 - `service/MarmaladeTtsService.kt` — `TextToSpeechService` subclass;
   handles `onSynthesizeText`, `onIsLanguageAvailable`, `onLoadLanguage`,
   `onGetLanguage`, `onLoadVoice`
+  - **Voice precedence** in `resolveSynthParams`: per-app mapping →
+    deliberate `request.voiceName` pick → primary alias → engine default.
+    A requested voice is an **auto-fill echo**, not a pick, when it equals
+    the primary's current voice, the Kitten default, or **any English
+    default this engine has presented before**
+    (`SettingsRepository.advertisedDefaultVoiceIds`, recorded when
+    `onGetDefaultVoiceNameFor` answers and whenever the primary alias
+    speaks; persisted). Without that last set, a client that cached the
+    advertised default keeps stamping the voice the primary alias used to
+    have after the user changes it, and the old voice outranks the new
+    primary forever ("system TTS always speaks the first voice I chose").
+    Non-English defaults are never recorded: those name a voice of the
+    requested language and must beat the English-shaped primary.
 - `service/CheckVoiceDataActivity.kt` — Android invokes this to
   enumerate installed voices (BCP-47 → ISO-639-3 conversion). Filters
   through `MarmaladeTtsService.advertisableVoices`, the same rule the

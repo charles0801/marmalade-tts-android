@@ -509,8 +509,16 @@ class MarmaladeTtsService : TextToSpeechService() {
         // pre-stamped with Kokoro Bella — and the primary never fired.
         // runBlocking is fine: this is a rare negotiation callback on a
         // binder thread, not the per-utterance synthesis hot path.
-        return runBlocking { router.resolveAlias(null)?.voiceId }
-            ?: KittenDirectVoiceCatalog.DEFAULT_VOICE_ID
+        return runBlocking {
+            val voice = router.resolveAlias(null)?.voiceId
+                ?: KittenDirectVoiceCatalog.DEFAULT_VOICE_ID
+            // Remember it: clients cache this answer, and once the user
+            // changes the primary alias's voice the cached value looks like
+            // a deliberate pick. resolveSynthParams treats a recorded value
+            // as an echo so the current primary alias still wins.
+            settings.recordAdvertisedDefaultVoice(voice)
+            voice
+        }
     }
 
     // Widened to public so MarmaladeTtsServiceTest can exercise the
@@ -865,12 +873,14 @@ class MarmaladeTtsService : TextToSpeechService() {
      *      **deliberate pick** — engine-default speed (1.0×) and no
      *      effect, because the caller asked for that exact voice. A
      *      requested voice is NOT deliberate when it merely echoes what
-     *      we advertise as the default (the primary alias's voice, or the
-     *      catalog default while a primary exists): clients auto-fill
-     *      `voiceName` from [onGetDefaultVoiceNameFor] / system Settings,
-     *      and before this distinction the auto-filled Kokoro default
-     *      outranked the primary alias on every request, so a Kitten
-     *      primary could never fire ("it keeps speaking Bella Kokoro").
+     *      we advertise as the default: the current primary alias's voice,
+     *      the catalog default while a primary exists, or any English
+     *      default this engine has advertised before
+     *      ([SettingsRepository.advertisedDefaultVoiceIds]) — clients
+     *      auto-fill and cache `voiceName` from
+     *      [onGetDefaultVoiceNameFor] / system Settings, so a value stamped
+     *      before the user changed the primary alias's voice would
+     *      otherwise outrank the new primary forever.
      *   3. Primary alias — same fields from the user-designated primary.
      *      Also taken when the caller requested exactly the primary's
      *      voice, so the alias's speed/effect ride along.
@@ -907,6 +917,14 @@ class MarmaladeTtsService : TextToSpeechService() {
             // caller-supplied voiceName is a deliberate pick or an
             // auto-filled echo of our advertised default.
             val primary: VoiceAlias? = router.resolveAlias(callerPackage)
+            // Every English default this engine has ever advertised. A
+            // client that cached one keeps stamping it after the user
+            // changes the primary alias's voice, and it must not read as a
+            // deliberate pick — that was "system TTS keeps speaking the
+            // voice I picked first". (Non-English defaults are not
+            // recorded: those name a voice of the requested language and
+            // must keep winning over the English-shaped primary.)
+            val advertisedDefaults = settings.advertisedDefaultVoiceIds.first()
 
             // 2. Caller-specified voice, when deliberate (see kdoc). With
             // no primary set, every requested voice is honored — there is
@@ -916,7 +934,8 @@ class MarmaladeTtsService : TextToSpeechService() {
             val deliberate = requested != null && (
                 primary == null ||
                     (requested != primary.voiceId &&
-                        requested != KittenDirectVoiceCatalog.DEFAULT_VOICE_ID)
+                        requested != KittenDirectVoiceCatalog.DEFAULT_VOICE_ID &&
+                        requested !in advertisedDefaults)
                 )
             if (requested != null && deliberate) {
                 val cachedEngine = voiceEngineCache[requested]?.engine
@@ -940,6 +959,14 @@ class MarmaladeTtsService : TextToSpeechService() {
 
             // 3. Primary alias fallback.
             if (primary != null) {
+                // Remember the alias's voice as a default echo too, not only
+                // when onGetDefaultVoiceNameFor advertises it: this also
+                // covers an upgrade from a build that recorded nothing, so
+                // changing the alias's voice later still wins over a client
+                // that cached the old one. Writes only when it is new.
+                if (primary.voiceId !in advertisedDefaults) {
+                    settings.recordAdvertisedDefaultVoice(primary.voiceId)
+                }
                 SynthParams(
                     voiceId = primary.voiceId,
                     speed = primary.speed,
